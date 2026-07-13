@@ -16,7 +16,7 @@ A payments platform that lets registered vendors (merchants) accept card and wal
 | **Vendor** | Merchant integrated with the public API. Owns transactions; authenticated per request (JWT). |
 | **Payer** | The cardholder. Never interacts with the platform directly (no hosted checkout in scope — see §10). |
 | **Acquirer bank** | External bank API that authorizes/declines operations. One integration service per bank. |
-| **Card networks** | Visa/Mastercard network tokenization (VTS/MDES) for stored-credential operations. |
+| **Card networks** | Visa/Mastercard network tokenization (VTS/MDES) for stored-credential operations, and the EMV 3DS Directory Server / issuer ACS for `authenticate`. |
 | **Wallet providers** | Apple Pay / Google Pay: source of encrypted wallet payloads. |
 | **Platform operator** | Runs the platform; consumes reporting and settlement outputs. |
 
@@ -35,7 +35,11 @@ All operations are submitted via the public API and processed asynchronously (§
 
 ### Initial operations
 
-- **FR-O1 — `authenticate`**: verifies that the card is valid and active **without reserving or moving funds** (zero-amount account verification against the acquirer). Terminal outcome: `AUTHORIZED` (verification passed) / `DECLINED` / `FAILED`. Not eligible for capture, void, or cancel.
+- **FR-O1 — `authenticate`**: performs EMV 3-D Secure (3DS) cardholder authentication via `threeds-service`, confirming with the card's issuer that the request originates from the legitimate cardholder, **without reserving or moving funds**. Optional: a vendor calls it independently, before an `authorise`/`payment`, when it wants 3DS liability-shift protection. Two possible outcomes, decided by the issuer (ARes):
+  - **Frictionless** — the issuer authenticates silently; the operation resolves directly to a terminal outcome (`AUTHORIZED` / `DECLINED` / `FAILED`).
+  - **Challenge** — the issuer requires cardholder interaction (OTP, biometric, etc.); the operation enters the non-terminal `CHALLENGE_REQUIRED` state (§5), exposing a `challengeUrl` (FR-D1) for the vendor to redirect the payer's browser to. Resolves to a terminal outcome once the payer completes the challenge, or `FAILED_CHALLENGE_TIMEOUT` if the challenge window elapses (default 10 minutes).
+
+  Not eligible for capture, void, or cancel. A successful `authenticate` produces authentication evidence (ECI, authentication value, `threeDsTransactionId`) that a subsequent `authorise`/`payment` can reference and forward to the acquirer (FR-O12).
 - **FR-O2 — `authorise`**: reserves funds on the card for the given amount without capturing them. Outcome `AUTHORIZED` reserves the funds; the reservation expires per acquirer rules (default validity window: 7 calendar days, configurable per vendor/acquirer) if not captured.
 - **FR-O3 — `payment`** (sale): authorization + capture in a single operation. Outcome `AUTHORIZED` is immediately followed by `CAPTURED` (single acquirer call; both state transitions recorded).
 
@@ -52,6 +56,7 @@ All operations are submitted via the public API and processed asynchronously (§
 - **FR-O9** — Every operation belongs to exactly one vendor; a vendor can only reference its own transactions (enforced from the JWT, returns `404` on foreign ids — never `403`, to avoid id-space probing).
 - **FR-O10** — Amounts are integers in **minor units** (e.g. cents); currency is **ISO 4217 alphabetic**. Zero/negative amounts are structurally invalid except `authenticate` (amount must be absent or zero).
 - **FR-O11** — Follow-up operations never carry card data; they reference the original transaction's token.
+- **FR-O12** — `authorise` and `payment` may optionally reference a prior successful `authenticate` transaction via `threeDsAuthenticationId` (FR-D1); when present, the authentication evidence produced by that transaction (ECI, authentication value, `threeDsTransactionId`) is forwarded to the acquirer with the authorization request, for 3DS liability-shift purposes.
 
 ## 5. Transaction lifecycle
 
@@ -70,6 +75,18 @@ CAPTURED   ──► VOIDED       (terminal — via void, before settlement cuto
 CAPTURED   ──► SETTLED      (terminal — included in a confirmed settlement batch)
 ```
 
+`authenticate` only — bypasses `TID_ASSIGNED` / `SENT_TO_ACQUIRER` (3DS is scheme-level, resolved by the card network's Directory Server and the issuer, not the acquirer bank):
+
+```
+REGISTERED ──► VALIDATED ──► SENT_TO_THREEDS ──┬─► AUTHORIZED   (frictionless)
+     │              │                          ├─► DECLINED     (terminal)
+     └─► REJECTED   └─► REJECTED               ├─► FAILED       (terminal)
+        (terminal)     (terminal)              └─► CHALLENGE_REQUIRED ──┬─► AUTHORIZED
+                                                                          ├─► DECLINED
+                                                                          ├─► FAILED
+                                                                          └─► FAILED (challenge timeout)
+```
+
 - **FR-L1** — Transitions and their triggers:
 
 | From | To | Trigger |
@@ -77,9 +94,14 @@ CAPTURED   ──► SETTLED      (terminal — included in a confirmed settleme
 | — | `REGISTERED` | Gateway accepts the request (`202`) |
 | `REGISTERED` | `VALIDATED` | Method service business validation passes |
 | `REGISTERED`/`VALIDATED` | `REJECTED` | Business validation fails (method service) |
-| `VALIDATED` | `TID_ASSIGNED` | TID allocated for vendor/acquirer |
+| `VALIDATED` | `TID_ASSIGNED` | TID allocated for vendor/acquirer (not `authenticate`) |
 | `TID_ASSIGNED` | `SENT_TO_ACQUIRER` | Acquirer adapter sends the request |
 | `SENT_TO_ACQUIRER` | `AUTHORIZED` / `DECLINED` / `FAILED` | Acquirer result |
+| `VALIDATED` | `SENT_TO_THREEDS` | 3DS authentication request sent (`authenticate` only) |
+| `SENT_TO_THREEDS` | `AUTHORIZED` / `DECLINED` / `FAILED` | Frictionless issuer decision (ARes) |
+| `SENT_TO_THREEDS` | `CHALLENGE_REQUIRED` | Issuer requires cardholder challenge (ARes) |
+| `CHALLENGE_REQUIRED` | `AUTHORIZED` / `DECLINED` / `FAILED` | Challenge completed (issuer RRes via callback, FR-A9) |
+| `CHALLENGE_REQUIRED` | `FAILED` | Challenge window elapses without completion (default 10 min) |
 | `AUTHORIZED` | `CAPTURED` | Sale auto-capture or successful `deferred` |
 | `AUTHORIZED` | `CANCELLED` | Successful `cancel` |
 | `AUTHORIZED` | `EXPIRED` | Validity window elapses without capture |
@@ -109,7 +131,10 @@ The minimal data set that identifies and describes a transaction platform-wide. 
 | `maskedCard` | BIN, last4, expiry month/year, scheme |
 | `networkTokenUsed` | Whether routing used a network token |
 | `acquirerId` | Resolved from vendor configuration |
-| `tid` | Terminal id, present from `TID_ASSIGNED` onward |
+| `tid` | Terminal id, present from `TID_ASSIGNED` onward (not `authenticate`) |
+| `threeDsAuthenticationId` | Optional; links an `authorise`/`payment` to a prior successful `authenticate` transaction (FR-O12) |
+| `challengeUrl` | Present only while `state = CHALLENGE_REQUIRED`; URL the vendor redirects the payer's browser to |
+| `returnUrl` | Vendor-supplied at submission of `authenticate` (mandatory, FR-A8); where the platform redirects the browser once the challenge completes |
 | `state` | Current lifecycle state (§5) |
 | `result` | Outcome detail (§8): platform result code + acquirer response code |
 | `createdAt`, `updatedAt` | UTC instants |
@@ -125,6 +150,9 @@ The minimal data set that identifies and describes a transaction platform-wide. 
 - **FR-A4 — Idempotency**: every state-creating request carries a vendor-supplied `Idempotency-Key` header (unique per vendor). Retries with the same key return the original `202` and the same `transactionId` without creating a duplicate. Keys are retained for at least 24 h. A reused key with a different payload returns `409`.
 - **FR-A5** — Authentication: JWT per request, scoped to one vendor. Invalid/expired token → `401`; valid token but disabled vendor → structural rejection.
 - **FR-A6** — API is versioned under `/api/v1/`; breaking changes require a new version prefix.
+- **FR-A7** — While `state = CHALLENGE_REQUIRED`, the status response (FR-A3) includes `challengeUrl` (FR-D1) so the vendor can redirect the payer's browser to complete the 3DS challenge.
+- **FR-A8** — `returnUrl` is a **mandatory** field on `authenticate` requests (structural validation, extends FR-A2): the issuer's frictionless-vs-challenge decision cannot be predicted by the vendor at submission time, so it must always be supplied.
+- **FR-A9** — The platform exposes a public, **unauthenticated** endpoint, `POST /api/v1/payments/{transactionId}/3ds-challenge-result`, that receives the issuer ACS's challenge-completion callback — a browser redirect as part of the EMV 3DS challenge flow, not a vendor-authenticated API call. It is validated against the pending challenge session opened when `CHALLENGE_REQUIRED` began (single-use, time-bound correlation token — see NFR-10), never the vendor JWT, and never carries card data. After processing, the platform redirects the browser to the vendor's `returnUrl`.
 
 ## 8. Business outcomes and result codes
 
@@ -134,8 +162,8 @@ The minimal data set that identifies and describes a transaction platform-wide. 
 | Family | Meaning | Examples |
 |---|---|---|
 | `REJECTED_*` | Failed business validation, never reached a bank | `REJECTED_DUPLICATE`, `REJECTED_INVALID_STATE`, `REJECTED_CARD_RULES`, `REJECTED_EXPIRED_CARD` |
-| `DECLINED_*` | Bank answered negatively | `DECLINED_GENERIC`, `DECLINED_INSUFFICIENT_FUNDS`, `DECLINED_SUSPECTED_FRAUD`, `DECLINED_DO_NOT_HONOUR` |
-| `FAILED_*` | Technical failure, outcome not obtained | `FAILED_ACQUIRER_TIMEOUT`, `FAILED_ACQUIRER_UNAVAILABLE`, `FAILED_INTERNAL` |
+| `DECLINED_*` | Bank/issuer answered negatively | `DECLINED_GENERIC`, `DECLINED_INSUFFICIENT_FUNDS`, `DECLINED_SUSPECTED_FRAUD`, `DECLINED_DO_NOT_HONOUR`, `DECLINED_AUTHENTICATION_FAILED` (issuer explicitly rejected 3DS authentication, e.g. wrong OTP) |
+| `FAILED_*` | Technical failure, outcome not obtained | `FAILED_ACQUIRER_TIMEOUT`, `FAILED_ACQUIRER_UNAVAILABLE`, `FAILED_INTERNAL`, `FAILED_CHALLENGE_TIMEOUT` (3DS challenge window elapsed without completion) |
 | `APPROVED` | Success for the requested operation | — |
 
 - **FR-R3** — Each acquirer adapter owns the mapping from its bank's response codes to platform result codes; the mapping is part of that adapter's spec and tests.
@@ -150,7 +178,7 @@ The minimal data set that identifies and describes a transaction platform-wide. 
 
 ## 10. Out of scope (v1)
 
-Refunds; hosted checkout; 3DS / redirect challenge flows; APMs (PayPal, etc.); fraud screening; multi-capture; multi-currency settlement per vendor account. See `ARCHITECTURE.md` §Planned Extensions.
+Refunds; hosted checkout; APMs (PayPal, etc.); fraud screening; multi-capture; multi-currency settlement per vendor account; 3DS / redirect challenge flows **for APMs** (cards are covered in v1 via `authenticate` + `threeds-service`, §3–§7). See `ARCHITECTURE.md` §Planned Extensions.
 
 ## 11. Non-functional requirements
 
@@ -159,20 +187,22 @@ Refunds; hosted checkout; 3DS / redirect challenge flows; APMs (PayPal, etc.); f
 - **NFR-3 — Delivery semantics:** all Kafka consumers are idempotent (at-least-once delivery); dedup key = `eventId`. Per-transaction ordering via partition key (`transactionId`, FR-D3).
 - **NFR-4 — Event contract:** events are versioned, backward-compatible, schema-registry-enforced snapshots carrying the canonical model (§6). Every event carries an envelope: `eventId` (UUID), `eventType`, `occurredAt`, `schemaVersion`, plus the snapshot.
 - **NFR-5 — Durability:** no accepted operation may be lost — state change and event are atomic (transactional outbox, `ARCHITECTURE.md`).
-- **NFR-6 — PCI:** CDE boundary and data-handling rules per `ARCHITECTURE.md` §PCI DSS Compliance; FR-D2 applies to every artifact in this repo including test fixtures (use test PANs only inside vault/proxy/adapter test code).
+- **NFR-6 — PCI:** CDE boundary and data-handling rules per `ARCHITECTURE.md` §PCI DSS Compliance; FR-D2 applies to every artifact in this repo including test fixtures (use test PANs only inside vault/proxy/adapter test code). `threeds-service` is in the CDE: it detokenizes at the last hop before sending the authentication request to the card scheme's Directory Server, the same pattern as `<acquirer-bank>-tx-service`.
 - **NFR-7 — Retention:** historical store ≥ 13 months (scheme dispute window); active database only in-flight + operational window; idempotency keys ≥ 24 h.
 - **NFR-8 — Availability:** submission path (proxy, gateway, vault tokenization) target 99.95%; asynchronous processing tolerates downstream outages by buffering in Kafka — a degraded acquirer must not affect other acquirers (per-bank isolation, `ARCHITECTURE.md`).
 - **NFR-9 — Auditability:** every detokenization call is audited (caller, transaction, timestamp); every state transition is traceable to its causing event (FR-L2).
+- **NFR-10 — Challenge session integrity:** the public 3DS challenge-callback endpoint (FR-A9) is unauthenticated by necessity (hit by the payer's browser, not the vendor) and must be protected against replay/forgery by a single-use, time-bound correlation token issued when `CHALLENGE_REQUIRED` began; a missing, expired, or reused token is rejected without changing transaction state.
 
 ## 12. Open questions for review
 
 1. **`void` vs `cancel` semantics (FR-O5/O6):** this spec defines `cancel` = release authorization, `void` = reverse unsettled capture. Confirm this matches the intended vendor-facing meaning, since `ARCHITECTURE.md` lists both without distinguishing them.
 2. **Refunds:** `ARCHITECTURE.md` (settlement section) mentions refunds among money-moving operations, but no refund operation exists in the gateway API. This spec declares refunds out of scope for v1 (FR-O8) — confirm, or add a `refund` operation now.
-3. **`authenticate` semantics (FR-O1):** defined here as zero-amount account verification. If it is instead meant as the future 3DS authentication step, it should move to Planned Extensions and out of v1.
-4. **`EXPIRED` and `SETTLED` states:** added by this spec (not in the `ARCHITECTURE.md` diagram) because authorization expiry and settlement confirmation are real lifecycle facts. Confirm, and update `ARCHITECTURE.md` accordingly.
-5. **Partial capture (FR-O4):** allowed (≤ authorized amount, single capture). Confirm.
-6. **Peak factor (NFR-1):** 10× average is an assumption; adjust if traffic is spikier (e.g. retail events).
+3. **`EXPIRED` and `SETTLED` states:** added by this spec (not in the `ARCHITECTURE.md` diagram) because authorization expiry and settlement confirmation are real lifecycle facts. Confirm, and update `ARCHITECTURE.md` accordingly.
+4. **Partial capture (FR-O4):** allowed (≤ authorized amount, single capture). Confirm.
+5. **Peak factor (NFR-1):** 10× average is an assumption; adjust if traffic is spikier (e.g. retail events).
+6. **3DS mandate (FR-O1/FR-O12):** `authenticate` is modeled as optional (vendor chooses whether to call it). If a regulatory mandate (e.g. PSD2/SCA) should make it compulsory for certain transactions/regions, that rule needs to be added explicitly — out of scope for this pass.
 
 ## Resolved
 
 - **Wallet decryption split (FR-M2/FR-M3, 2026-07-13):** confirmed that `applepay-service` decrypts payloads itself (no real PAN ever possible, per Apple's wallet spec) while `googlepay-service` always routes through `card-vault-service` regardless of the vendor's configured auth method, since Google Pay's `PAN_ONLY` mode can carry the real PAN. `ARCHITECTURE.md` updated accordingly (`applepay-service`, `googlepay-service`, `card-vault-service`, `vendor-service`, PCI DSS Compliance sections).
+- **`authenticate` = 3DS authentication, with challenge support (FR-O1/FR-O12, 2026-07-13):** confirmed `authenticate` performs EMV 3DS cardholder authentication via a new `threeds-service`, with full challenge-redirect support in v1 (not deferred, unlike the original `ARCHITECTURE.md` Planned Extensions note). Adds the `CHALLENGE_REQUIRED` state, `threeDsAuthenticationId` / `challengeUrl` / `returnUrl` fields, a public challenge-callback endpoint (FR-A9), and puts `threeds-service` in the PCI CDE (detokenizes to route the AReq to the card scheme's Directory Server). `ARCHITECTURE.md` updated (`threeds-service` section, CDE list, Planned Extensions, Payment Flow, Repository Layout, `bank-simulator-service`).
