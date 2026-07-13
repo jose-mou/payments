@@ -1,0 +1,348 @@
+# Architecture
+
+## Overview
+
+Payments App is a payments management platform built as a set of event-driven microservices. Vendors (merchants) call a single public REST API: a thin tokenizing proxy (`pan-proxy-service`) fronts the **gateway** so raw card data never enters the core platform; behind it, method-specific and bank-specific services process each operation asynchronously through Kafka. Each microservice is an independent Spring Boot application living in its own top-level directory and owning its own PostgreSQL database.
+
+```
+┌─────────┐  REST + JWT   ┌───────────────────┐  tokenized   ┌─────────────────┐
+│ Vendors │ ────────────► │ pan-proxy-service │ ───────────► │ gateway-service │ ◄── status polling (202 + Location)
+└─────────┘   (PAN/CVV)   └───────────────────┘   request    └────────┬────────┘
+                                                               outbox │ (Debezium relay)
+                                                                      ▼
+      ┌───────────────── Kafka (token + masked data only) ───────────────────┐
+      │                                                                      │
+      ▼                                                                      │
+┌───────────────────────────┐   ┌────────────────────────┐   ┌────────────────────────────┐
+│ card-transactions-service │ ─►│ tid-assignment-service │ ─►│ <acquirer-bank>-tx-service │ ─► bank API
+└───────────────────────────┘   └────────────────────────┘   │ (one per acquirer)         │    (simulator in dev)
+      │ rejection                                            └─────────────┬──────────────┘
+      ▼                                                                    │ result
+┌──────────────────────┐                                                   ▼
+│ notification-service │ ◄──────────────────── result events ──────────────┴──► gateway-service (state update)
+└──────────────────────┘                                                   └──► tid-assignment-service (TID release)
+
+┌────────────────────┐  tokenize ◄── pan-proxy-service │ detokenize ◄── <acquirer-bank>-tx-service
+│ card-vault-service │  sole store of encrypted PAN; CVV transient (short TTL)
+└────────────────────┘  wallet payload decryption (Apple/Google certs) — DPAN never leaves
+
+┌──────────────────┐  ┌───────────────────┐  decrypt via card-vault-service, then join the
+│ applepay-service │  │ googlepay-service │  card rail at card-transactions-service
+└──────────────────┘  └───────────────────┘  (dev: applepay/googlepay-simulator-service)
+
+┌────────────────────┐  ┌──────────────────────────┐  network tokens (VTS/MDES) provisioned
+│ visa-token-service │  │ mastercard-token-service │  after first authorization, used for
+└────────────────────┘  └──────────────────────────┘  stored-credential operations
+
+┌────────────────┐
+│ vendor-service │  vendor onboarding & configuration (replicated via events)
+└────────────────┘
+
+┌───────────────────┐  all lifecycle events   ┌───────────────────────────┐
+│ reporting-service │ ◄─────── Kafka          │ Aurora PostgreSQL (hist.) │ ◄── backoffice
+│                   │ ──────────────────────► │ + OpenSearch (search)     │     (vendor UI)
+└───────────────────┘                         └───────────────────────────┘
+
+┌────────────────────┐  money-moving events        daily settlement files
+│ settlement-service │ ◄─────── Kafka          ──────────────────────────► bank SFTP
+└────────────────────┘                              (per-bank cutoff)
+```
+
+## Architectural Principles
+
+1. **Event-driven communication.** Services communicate asynchronously by publishing and consuming domain events on Kafka whenever possible. Synchronous REST calls between services are an exception that must be explicitly justified.
+2. **Transactional outbox.** State changes and their events are persisted in the same database transaction; a Debezium relay publishes the outbox to Kafka. Events are never lost or published without their state change.
+3. **Database per service.** Each microservice owns its data and schema. Data needed from other services is obtained by consuming their events (e.g. the gateway keeps a local replica of vendor configuration).
+4. **DDD + Hexagonal architecture.** Each microservice maps to a bounded context with `domain` / `application` / `infrastructure` layers; dependencies point inward only.
+5. **Asynchronous API.** The gateway accepts an operation, persists it, and responds immediately with `202 Accepted` and a status URL. Results are delivered through status polling and vendor notifications.
+
+## Microservices
+
+### pan-proxy-service
+
+Thin tokenizing reverse proxy in front of the gateway — the only public component that sees raw cardholder data.
+
+- Fronts the vendor-facing API: requests carrying PAN/CVV pass through it in the same single call (no extra step for vendors).
+- Extracts PAN/CVV from the payload, exchanges them for a token via `card-vault-service`, and forwards the request to the gateway carrying only token + masked data (BIN, last4, expiry).
+- Deliberately dumb: parses, substitutes fields, forwards. No business logic and a minimal change rate, keeping the audited surface small and stable. Requests without card data pass through untouched.
+
+### card-vault-service
+
+Sole custodian of raw card data.
+
+- Stores the PAN encrypted with HSM/KMS-managed keys and issues the token used everywhere else in the platform.
+- Holds the CVV only transiently (encrypted, short TTL, pre-authorization) and deletes it irrecoverably once the authorization completes. The CVV is never persisted anywhere else.
+- Decrypts Apple Pay / Google Pay encrypted payloads — it holds the wallet payment-processing certificates — and returns the internal token for the DPAN, which never leaves the vault.
+- Exposes detokenization exclusively to the `<acquirer-bank>-tx-service`, `visa-token-service` and `mastercard-token-service` services (mTLS + service allowlist, audited).
+
+### gateway-service
+
+Public entry point of the platform (behind `pan-proxy-service`).
+
+- Exposes the vendor-facing REST API supporting the card operation types: `authenticate`, `authorise`, `payment` (sale), `void`, `cancel`, `deferred` (capture).
+- Processes **tokenized requests only** — raw PAN/CVV never reach the gateway, which keeps it and everything behind it out of PCI scope.
+- Authenticates every request with **JWT**, scoped per vendor — a vendor can only operate on its own transactions.
+- Performs **structural validation** (required fields, formats, amounts, currency, supported method, vendor active) and rejects invalid requests synchronously with `400`.
+- Persists the transaction and its domain event atomically (outbox + Debezium) and responds `202 Accepted` with a `Location` header pointing to the status endpoint (`GET /api/v1/payments/{id}`).
+- Owns the **canonical payment record and state machine**, updated by consuming result events from the processing services.
+
+### vendor-service
+
+Manages the vendors (merchants/providers) registered on the platform: onboarding, credentials, configuration (enabled payment methods, acquirer bank, TID pool size). Publishes vendor lifecycle events so other services (gateway, tid-assignment-service) can keep local replicas of the configuration they need.
+
+### card-transactions-service
+
+Card processing entry point: direct card payments, card-rail operations handed off by the wallet services (Apple Pay / Google Pay), and payments with stored network tokens.
+
+- Consumes payment events from the gateway.
+- Performs **card-specific business validation** (card data rules, operation allowed for the current transaction lifecycle, duplicates).
+- On success, publishes the validated operation for TID assignment.
+- On failure, publishes a rejection event consumed by `notification-service` and by `gateway-service` (state update).
+
+### applepay-service
+
+Apple Pay payments logic.
+
+- Consumes Apple Pay operations published by the gateway. The Apple payment token travels **encrypted end-to-end** — `pan-proxy-service` passes it through untouched (no raw PAN in the payload).
+- Delegates payload decryption to `card-vault-service` (holder of the Apple payment-processing certificates), receiving back the internal token for the DPAN — this keeps the service **out of PCI scope**.
+- Validates the wallet operation (cryptogram, expiry, amount consistency) and publishes it as a card-rail operation consumed by `card-transactions-service`; from there the standard card flow applies (validation, TID, acquirer).
+
+`applepay-simulator-service` (development only) simulates Apple's payloads and responses in the development environment.
+
+### googlepay-service
+
+Google Pay equivalent of `applepay-service`: same pattern — encrypted wallet payload passed through untouched, decryption delegated to `card-vault-service`, wallet validation, then hand-off to the card rail. `googlepay-simulator-service` (development only) simulates Google's responses.
+
+### visa-token-service / mastercard-token-service
+
+Network tokenization services (Visa VTS and Mastercard MDES).
+
+- Consume `payment.authorized` events: after a successful first authorization, they provision a **network token** for the card against the network API and store the vault-token ↔ network-token mapping in their own database.
+- Publish `network-token.provisioned` events; `card-transactions-service` keeps a local replica and routes subsequent stored-credential operations through the network token (higher approval rates, resilience to card reissuance).
+- Provisioning requires the real PAN, so they detokenize against `card-vault-service` at the moment of the network call — the same last-hop pattern as `<acquirer-bank>-tx-service` — which places **both services in PCI scope**.
+
+### tid-assignment-service
+
+Manages the **TID (Terminal ID) pool** for card payments. The number of TIDs per vendor and acquirer bank is limited and determines how many operations that vendor can run in parallel against that bank.
+
+- Consumes validated card operations **before** they reach the acquirer service.
+- Allocates a free TID from the vendor/acquirer pool and attaches it to the operation; operations wait when the pool is exhausted (natural throttling).
+- Releases the TID when the operation result event is published by the acquirer service.
+
+### \<acquirer-bank\>-tx-service (one service per acquirer bank)
+
+Bank integration adapter (e.g. `redsys-tx-service`, `stripe-tx-service`).
+
+- Consumes TID-assigned operations for its bank.
+- Detokenizes the card against `card-vault-service` immediately before calling the bank — the only point in the flow where the real PAN is used.
+- Calls the acquirer bank API and handles its protocol specifics (retries, timeouts, certificates).
+- Publishes the operation result (`authorized`, `declined`, `failed`), consumed by `notification-service`, `gateway-service`, and `tid-assignment-service`.
+
+Having **one service per acquirer bank** (instead of a single bank-integration service) is deliberate:
+
+- **Runtime isolation**: a degraded bank must not backpressure the others — separate consumer groups, thread pools and timeouts per bank.
+- **Independent releases and certifications**: acquirer integrations go through certification cycles; changing bank A's code must not redeploy bank B's certified artifact.
+- **Credential isolation**: certificates and secrets are scoped per bank (also a plus in PCI audits).
+- **Independent scaling**: each bank has its own volume and TID pool.
+
+Code reuse across adapters comes from the shared `bank-adapter-starter` library (see Shared Libraries), never from merging deployables — each service implements only its bank's protocol adapter.
+
+### notification-service
+
+Notifies the vendor of the final result of each operation (webhook to the vendor's configured callback URL), consuming rejection and result events.
+
+### settlement-service
+
+End-of-day settlement: generates, per acquirer bank, the file with all money-moving operations of the day and delivers it over **SFTP**. A background batch process — no request/response path.
+
+- A **single service for all banks** (the opposite strategy to `<acquirer-bank>-tx-service`, deliberately): the forces that demand per-bank isolation don't apply to a nightly batch — no latency to protect, no noisy neighbor, failures are retried within the settlement window. Per-bank variability (file format, SFTP credentials/endpoint) is handled by **per-bank adapters** behind hexagonal ports (`SettlementFileFormat`, file delivery), so extracting a bank into its own service later stays cheap.
+- Builds its **own projection**: consumes the lifecycle events of money-moving operations (sales, captures, refunds, voids) into its own PostgreSQL, modeled for settlement (operations grouped by bank and cutoff window, with batch-inclusion state). It never queries the gateway's active database. Short retention: rows are kept only a few days after batch confirmation — the canonical archive lives in reporting.
+- Each bank has its own **cutoff time and timezone**; file generation runs per bank at its cutoff.
+- **Pre-generation reconciliation**: before generating a file, aggregate counts and amounts of the projection are compared against the reporting archive (Aurora) for that bank and window. A mismatch **blocks generation and raises an alert** — an incomplete settlement file must never be sent. (Same pattern as the active-database purger: reconcile projections before an irreversible step.)
+- **Idempotent regeneration**: the file for a given bank/day is a versioned, traceable artifact that can be regenerated (SFTP failure, bank rejection) without double-settling.
+- Publishes `settlement.batch.completed` events, consumed by reporting/backoffice.
+- **Post-settlement reconciliation** against the bank's response files (what the bank confirms it settled) closes the loop.
+- **PCI note**: the service joins the CDE **only if** some bank's file format requires the full PAN — in that case it detokenizes in batch against `card-vault-service` at generation time (same last-hop pattern as `<acquirer-bank>-tx-service`). With token/masked-PAN formats it stays out of scope. Verify per bank.
+
+### reporting-service
+
+Builds the historical/reporting store by consuming **all** transaction lifecycle events:
+
+- Writes the canonical archive to **Aurora PostgreSQL**: exact aggregates (reconciliation, settlement), transaction detail, exports, and the source for rebuilding OpenSearch indices when mappings change.
+- Indexes transactions into **OpenSearch** for search, filtering and listings, using time-based indices managed with ILM (rollover and deletion per retention policy).
+
+### backoffice (vendor UI)
+
+Web application where vendors consult their transactions. Uses OpenSearch for searches, listings and filters, and the Aurora PostgreSQL reporting database for transaction detail, exact reports and exports. Every query is scoped to the authenticated vendor (JWT), same identity model as the gateway API.
+
+### bank-simulator-service (development only)
+
+A **single** simulator service emulating every acquirer bank API for the development environment, with one path prefix per bank (e.g. `/redsys/...`, `/stripe/...`) and per-bank behavior modules. Grouping the simulators — the opposite strategy to the per-bank `<acquirer-bank>-tx-service` services — is deliberate: none of the forces that demand isolation apply here (no PCI scope, no noisy-neighbor impact, no certifications), and a single container keeps the development environment light.
+
+- Supports scenario triggering through **magic data**: specific amounts or test cards force `approved`, `declined`, timeouts or slow responses — simulating failure paths is its main value.
+- Shares the bank protocol contracts with the real adapters (see Shared Libraries) so it cannot drift out of sync.
+- Never deployed to production.
+
+## Shared Libraries
+
+Cross-cutting code is reused through internal libraries under `libs/`, consumed by services as Gradle dependencies — **reuse lives in libraries, isolation lives in deployment**:
+
+- `bank-adapter-starter` — common machinery for the `<acquirer-bank>-tx-service` services: idempotent Kafka consumption, `card-vault-service` client, transactional outbox publishing, retry/timeout handling and observability.
+- `bank-protocol-contracts` — per-bank protocol models shared between each `<acquirer-bank>-tx-service` service and `bank-simulator-service`.
+
+## Payment Flow (cards)
+
+1. The vendor calls the public REST API (JWT) with an operation request; `pan-proxy-service` swaps PAN/CVV for a `card-vault-service` token and forwards the tokenized request to the gateway — one single call from the vendor's perspective.
+2. The gateway validates structurally, persists the transaction + outbox event, and responds `202 Accepted` with the status URL.
+3. Debezium relays the event to Kafka; `card-transactions-service` consumes it and runs card business validation.
+   - **Invalid** → rejection event → `notification-service` notifies the vendor, `gateway-service` marks the transaction as rejected.
+4. `tid-assignment-service` allocates a TID for the vendor/acquirer pair.
+5. `<acquirer-bank>-tx-service` detokenizes the card via `card-vault-service`, sends the request to the bank and publishes the result.
+6. The result event is consumed by `gateway-service` (state update, visible via polling), `notification-service` (vendor webhook), and `tid-assignment-service` (TID release).
+
+**Wallet variant**: Apple Pay / Google Pay operations are first consumed by `applepay-service` / `googlepay-service` (payload decryption via `card-vault-service`, wallet validation) and join the card rail at `card-transactions-service` from step 3 onwards.
+
+**Stored-credential variant**: when a network token exists for the card (provisioned by `visa-token-service` / `mastercard-token-service` after the first authorization), `card-transactions-service` routes the operation through the network token instead of the vault token.
+
+### Transaction state machine (owned by gateway-service)
+
+```
+REGISTERED → VALIDATED → TID_ASSIGNED → SENT_TO_ACQUIRER → AUTHORIZED | DECLINED | FAILED
+     │            │                                             │
+     └── REJECTED ┘                            (follow-up ops)  ├─► CAPTURED (deferred)
+                                                                └─► VOIDED / CANCELLED
+```
+
+Follow-up operations (`void`, `cancel`, `deferred` capture) reference the original transaction and are only accepted when the current state allows them.
+
+## Validation Strategy
+
+Validation is layered so that fast feedback does not require synchronous coupling:
+
+1. **Structural** — gateway, synchronous `400` (fields, formats, vendor, method).
+2. **Method-specific business rules** — owning method service (e.g. `card-transactions-service`), asynchronous; failure is a business outcome (rejection event), not an HTTP error.
+3. Every service **re-validates state on consumption** — an earlier validation result may be stale by processing time.
+
+## Communication
+
+### Synchronous (REST)
+
+- Vendor-facing only: submit operations, poll transaction status. JSON over HTTP, versioned under `/api/v1/...`, JWT-authenticated per vendor.
+
+### Asynchronous (Kafka)
+
+- The default mechanism for service-to-service communication.
+- Events are past-tense facts (`payment.authorized`), published through the transactional outbox.
+- Topic naming: `<service-name>.<entity>.<event>` (e.g. `card-transactions-service.card-payment.rejected`).
+- Events are the public contract of a service: versioned, backward compatible.
+- Consumers are idempotent — the same event may be delivered more than once.
+
+## Event Payload Strategy
+
+Events carry the **full transaction data** (event-carried state transfer), not just an ID:
+
+- Consumers never call back to the gateway to fetch transaction data — no synchronous coupling, no query storm at 5M transactions/day, and the stream is self-contained (replays, new consumers, rebuilding projections).
+- Event schemas are managed in a **schema registry** (Avro or Protobuf) with mandatory backward compatibility — with full payloads, every consumer depends on the event contract.
+- An event is an **immutable snapshot** at publication time, never current state — which is why every service re-validates state on consumption.
+- Card data in events is restricted to **token + masked fields** (BIN, last4, expiry). Raw PAN and CVV are never published to Kafka (see PCI DSS Compliance).
+
+## PCI DSS Compliance
+
+The cardholder data environment (CDE) is limited to: **`pan-proxy-service`, `card-vault-service`, the `<acquirer-bank>-tx-service` services, `visa-token-service` and `mastercard-token-service`**. Everything else — gateway, Kafka, processing services, wallet services, reporting, backoffice — handles tokens and masked data only, keeping it out of PCI scope.
+
+- Raw card data enters the platform only through `pan-proxy-service` and is tokenized before reaching the gateway, in the same API call (no extra steps for vendors).
+- PAN at rest exists only in `card-vault-service`, encrypted with HSM/KMS-managed keys.
+- CVV is never stored beyond authorization: transient in the vault with a short TTL and irrecoverably deleted once the authorization completes. It is never written to Kafka — topic retention counts as storage under PCI DSS.
+- Detokenization happens only at the last hop before an external network — bank adapters and the network token services (provisioning requires the real PAN) — restricted by mTLS and a service allowlist, and audited.
+- Wallet payloads (Apple Pay / Google Pay) are decrypted **inside** `card-vault-service`, which holds the payment-processing certificates; the decrypted DPAN never leaves the vault, keeping `applepay-service` and `googlepay-service` out of scope.
+- `settlement-service` joins the CDE only if a bank's settlement file format requires the full PAN (batch detokenization at file generation); with token/masked formats it stays out of scope.
+- Baseline hygiene everywhere: TLS/mTLS in transit, encryption at rest for brokers and databases, and no card data in logs.
+
+## Data Consistency
+
+- Consistency across services is **eventual**, achieved through events rather than distributed transactions.
+- Multi-service flows are **choreography-based sagas** with the gateway as the state holder; failure paths publish compensating/rejection events (including TID release).
+
+## Data Lifecycle & Scalability
+
+Target volume: **~5 million transactions per day**. The design separates the hot processing path from historical consultation with two stores:
+
+- **Active database (gateway)** — holds only in-flight transactions and those still within their operational window (eligible for void, cancel, deferred capture, or pending failure analysis). The transactions table is **partitioned by day**.
+- **Historical/reporting store (Aurora PostgreSQL + OpenSearch)** — fed by `reporting-service` from the lifecycle events. This is where the backoffice reads; the active database never serves backoffice queries.
+
+Purge policy for the active database:
+
+1. A background process removes transactions once they are in a **terminal state**, their **operational window has expired**, and their presence in the historical store has been **verified** (batch reconciliation by ID). If the reporting projection lags, purging stalls automatically instead of losing data.
+2. Purging is implemented by **dropping day partitions**, not row `DELETE`s — instant and free of vacuum bloat at this volume. The few rows in an old partition still inside their operational window are relocated before the drop.
+3. Transactions are therefore **duplicated in both stores during the overlap period** — this is expected; readers are unambiguous (processing reads active, backoffice reads historical).
+
+Additional scaling measures:
+
+- Status polling (`GET /payments/{id}`) scales with **read replicas** of the active database.
+- Intermediate services (`card-transactions-service`, `tid-assignment-service`, `<acquirer-bank>-tx-service`) keep only short-retention local data; the gateway and the historical store hold the canonical records.
+- Historical retention is policy-driven: card schemes require ~13 months for disputes; regulatory requirements may extend it. OpenSearch indices are rolled over and deleted by ILM; the Aurora archive is partitioned by month.
+
+## Repository Layout
+
+Each microservice would ideally live in its own repository. For simplicity this project is a monorepo where each top-level directory is an independent, separately buildable and deployable unit (`libs/` is the exception: shared internal libraries consumed as Gradle dependencies, never deployed):
+
+```
+payments-app/
+├── CLAUDE.md                    # Development practices
+├── README.md
+├── doc/
+│   ├── ARCHITECTURE.md          # This document
+│   └── specs/                   # Feature specifications (Spec-Driven Development)
+├── pan-proxy-service/                   # PCI scope
+├── card-vault-service/                  # PCI scope
+├── gateway-service/
+├── vendor-service/
+├── card-transactions-service/
+├── applepay-service/
+├── googlepay-service/
+├── visa-token-service/          # PCI scope
+├── mastercard-token-service/    # PCI scope
+├── tid-assignment-service/
+├── <acquirer-bank>-tx-service/          # One per acquirer bank — PCI scope
+├── notification-service/
+├── settlement-service/          # PCI scope only if a bank file format requires full PAN
+├── reporting-service/
+├── backoffice/                  # Vendor-facing web application
+├── bank-simulator-service/              # Development only — all banks in one service
+├── applepay-simulator-service/          # Development only
+├── googlepay-simulator-service/         # Development only
+└── libs/                        # Shared internal libraries (bank-adapter-starter, bank-protocol-contracts)
+```
+
+## Microservice Internal Structure
+
+Every service follows the same hexagonal layout:
+
+```
+<service-name>/
+└── src/main/java/com/kaleido/software/<service-name>/
+    ├── domain/          # Entities, value objects, domain services, domain events
+    ├── application/     # Use cases and ports (interfaces)
+    └── infrastructure/  # Adapters: REST controllers, Kafka, JPA, Debezium outbox, configuration
+```
+
+- **domain** — pure Java, no Spring or persistence annotations. Contains all business rules.
+- **application** — orchestrates use cases; defines inbound ports (use case interfaces) and outbound ports (repository, event publisher interfaces).
+- **infrastructure** — implements the ports: REST controllers (inbound), Kafka producers/consumers, JPA repositories (outbound), and Spring configuration.
+
+## Testing Strategy
+
+- **Unit tests** (JUnit 6 + Mockito) cover the domain and application layers — written first, following TDD.
+- **Integration tests** use Testcontainers to spin up real PostgreSQL and Kafka instances; no dependency on locally installed infrastructure.
+- End-to-end flows in development run against `bank-simulator-service`, using its magic-data scenarios to exercise failure paths (declines, timeouts, slow banks).
+- CI must pass (build + all tests) before any merge into `main`.
+
+## Planned Extensions
+
+Discussed and intentionally deferred:
+
+- **APM services** (`paypal-payments`, etc.) for redirect-based methods (PayPal, AmazonPay, AliPay) with a payment-only lifecycle.
+- **Hosted checkout**: register a transaction first (`REGISTERED` state, no method), then the payer completes it in a platform-hosted UI — keeps vendors out of PCI DSS scope. Requires session expiry and one-time UI tokens.
+- **fraud-screening** service; its position in the chain (blocking pre-auth vs. post-auth analysis) is still to be decided.
+- **3DS / redirect challenge flows** as a common gateway concept (needed by both cards and APMs).
+- **Internal BI/analytics tier** (e.g. Amazon Redshift) fed from the same Kafka events for long-range trend analysis — never used to serve backoffice queries.
