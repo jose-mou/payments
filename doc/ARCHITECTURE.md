@@ -22,6 +22,10 @@ Payments App is a payments management platform built as a set of event-driven mi
 │ notification-service │ ◄──────────────────── result events ──────────────┴──► gateway-service (state update)
 └──────────────────────┘                                                   └──► tid-assignment-service (TID release)
 
+CARD only: card-transactions-service also publishes to / consumes from threeds-service — to
+validate/consume the `authenticate` reference before an `authorise`, or to run payment's embedded
+3DS step — before continuing to tid-assignment-service (see threeds-service, card-transactions-service).
+
 ┌────────────────────┐  tokenize ◄── pan-proxy-service │ detokenize ◄── <acquirer-bank>-tx-service,
 │ card-vault-service │  sole store of encrypted PAN; CVV transient (short TTL)      threeds-service
 └────────────────────┘  Google Pay payload decryption (Google certs) — always, any auth method
@@ -30,12 +34,13 @@ Payments App is a payments management platform built as a set of event-driven mi
 │ applepay-service │  │ googlepay-service │  is real PAN. googlepay: never decrypts, always
 └──────────────────┘  └───────────────────┘  via vault. Both join the card rail at
                                               card-transactions-service (dev: *-simulator-service)
+                                              — no 3DS involved for these methods.
 
-┌─────────────────┐  EMV 3DS cardholder authentication for `authenticate` (optional,
-│ threeds-service │  independent of the card rail). Detokenizes via card-vault-service
-└─────────────────┘  (last hop, PCI scope) to route the AReq to the scheme's Directory
-                      Server. Frictionless → terminal result; challenge → redirect the
-                      payer, then a public callback resumes processing.
+┌─────────────────┐  EMV 3DS for CARD only: standalone `authenticate`, `authorise`'s
+│ threeds-service │  reference check, and `payment`'s embedded 3DS step. Detokenizes
+└─────────────────┘  via card-vault-service (last hop, PCI scope) to route the AReq
+                      to the scheme's Directory Server. Frictionless → continue/
+                      terminal; challenge → redirect payer, callback resumes.
 
 ┌────────────────────┐  ┌──────────────────────────┐  network tokens (VTS/MDES) provisioned
 │ visa-token-service │  │ mastercard-token-service │  after first authorization, used for
@@ -86,7 +91,7 @@ Sole custodian of raw card data.
 
 Public entry point of the platform (behind `pan-proxy-service`).
 
-- Exposes the vendor-facing REST API supporting the card operation types: `authenticate`, `authorise`, `payment` (sale), `void`. (`cancel` and `deferred` capture are descoped for v1 — see Planned Extensions.)
+- Exposes the vendor-facing REST API supporting the card operation types: `authenticate`, `authorise`, `payment` (sale), `void`, `refund`. (`cancel` and `deferred` capture are descoped for v1 — see Planned Extensions.)
 - Processes **tokenized requests only** — raw PAN/CVV never reach the gateway, which keeps it and everything behind it out of PCI scope.
 - Authenticates every request with **JWT**, scoped per vendor — a vendor can only operate on its own transactions.
 - Performs **structural validation** (required fields, formats, amounts, currency, supported method, vendor active) and rejects invalid requests synchronously with `400`.
@@ -102,8 +107,10 @@ Manages the vendors (merchants/providers) registered on the platform: onboarding
 
 Card processing entry point: direct card payments, card-rail operations handed off by the wallet services (Apple Pay / Google Pay), and payments with stored network tokens.
 
-- Consumes payment events from the gateway.
+- Consumes payment events from the gateway (`authorise`, `payment`, `void`, `refund` — not `authenticate`, which `threeds-service` consumes directly).
 - Performs **card-specific business validation** (card data rules, operation allowed for the current transaction lifecycle, duplicates).
+- For `CARD` `authorise`: after its own validation passes, publishes the operation for `threeds-service` to check and consume the referenced `authenticate` transaction (same vendor, `AUTHORIZED`, unexpired, not already referenced); consumes the resulting event and either proceeds to TID assignment or publishes a rejection (`REJECTED_INVALID_STATE`). See `threeds-service`.
+- For `CARD` `payment`: after its own validation passes, publishes the operation for `threeds-service` to run the embedded 3DS step; consumes the resulting `THREEDS_AUTHENTICATED` (proceeds to TID assignment) or terminal (`DECLINED`/`FAILED`) event. Not applicable to `APPLE_PAY`/`GOOGLE_PAY` `payment`, which proceed directly to TID assignment.
 - On success, publishes the validated operation for TID assignment.
 - On failure, publishes a rejection event consumed by `notification-service` and by `gateway-service` (state update).
 
@@ -123,14 +130,13 @@ Consumes Google Pay operations published by the gateway; the wallet payload pass
 
 ### threeds-service
 
-EMV 3-D Secure (3DS) cardholder authentication for the `authenticate` operation — independent of, and optional ahead of, the card rail (`authenticate` is not itself an `authorise`/`payment`, and never reaches `card-transactions-service`, `tid-assignment-service` or `<acquirer-bank>-tx-service`: 3DS is resolved at the card scheme / issuer level, not the acquirer bank).
+EMV 3-D Secure (3DS) cardholder authentication, `CARD` only (`APPLE_PAY`/`GOOGLE_PAY` are exempt — the wallet's own device-level cardholder verification already covers this). Serves three distinct calls, all against the scheme's Directory Server:
 
-- Consumes `authenticate` operations from the gateway.
-- Detokenizes the card via `card-vault-service` immediately before sending the authentication request (AReq) to the card scheme's Directory Server — the same last-hop pattern as `<acquirer-bank>-tx-service` and the network token services — which places it **in PCI scope**.
-- On a **frictionless** issuer decision (ARes), publishes the terminal outcome directly (`AUTHORIZED` / `DECLINED` / `FAILED`).
-- On a **challenge** decision, transitions the transaction to `CHALLENGE_REQUIRED` and publishes a challenge URL for the gateway to expose via polling; consumes the challenge-completion callback (received by the gateway's public, unauthenticated endpoint and relayed to `threeds-service`) and publishes the final outcome, or `FAILED` if the challenge window elapses.
-- Publishes authentication evidence (ECI, authentication value, `threeDsTransactionId`) on success; `card-transactions-service` forwards it to the acquirer when a subsequent `authorise`/`payment` references the `authenticate` transaction, for liability-shift purposes.
-- **One service across all card schemes** (unlike `visa-token-service` / `mastercard-token-service`, which are split because VTS and MDES are genuinely different provisioning APIs): EMV 3DS 2.x defines a common message specification across schemes — only the Directory Server endpoint and per-scheme certificates differ, handled as internal adapters within the service.
+- **Standalone `authenticate`**: consumed directly from the gateway (never reaches `card-transactions-service`, `tid-assignment-service` or `<acquirer-bank>-tx-service` — 3DS is resolved at the card scheme/issuer level, not the acquirer bank). Detokenizes the card via `card-vault-service` immediately before sending the authentication request (AReq) — the same last-hop pattern as `<acquirer-bank>-tx-service` and the network token services — which places it **in PCI scope**. On a **frictionless** issuer decision (ARes), publishes the terminal outcome directly (`AUTHORIZED` / `DECLINED` / `FAILED`). On a **challenge** decision, transitions the transaction to `CHALLENGE_REQUIRED` and publishes a challenge URL for the gateway to expose via polling; consumes the challenge-completion callback (received by the gateway's public, unauthenticated endpoint and relayed here) and publishes the final outcome, or `FAILED` if the challenge window elapses. Publishes authentication evidence (ECI, authentication value, `threeDsTransactionId`) on success, one-time-use (see next point).
+- **`authorise` reference check**: consumes `authorise` operations published by `card-transactions-service` after its own validation. Validates and atomically consumes (marks used) the referenced `authenticate` transaction — same vendor, `AUTHORIZED`, unexpired, not already referenced (enforced here to avoid a race between concurrent `authorise` requests reusing the same reference) — and publishes the result for `card-transactions-service` to continue or reject; does not itself talk to the Directory Server for this step (3DS already happened in the standalone `authenticate`).
+- **`payment`'s embedded 3DS step**: consumes `CARD` `payment` operations published by `card-transactions-service` after its own validation, before TID assignment. Runs the same AReq/ARes flow as standalone `authenticate` (detokenize, frictionless or challenge), but publishes `THREEDS_AUTHENTICATED` to continue the *same* transaction toward TID assignment, rather than a terminal outcome.
+
+**One service across all card schemes** (unlike `visa-token-service` / `mastercard-token-service`, which are split because VTS and MDES are genuinely different provisioning APIs): EMV 3DS 2.x defines a common message specification across schemes — only the Directory Server endpoint and per-scheme certificates differ, handled as internal adapters within the service.
 
 `bank-simulator-service` (development only) also simulates the scheme Directory Server / issuer ACS behavior — see below.
 
@@ -222,28 +228,44 @@ Cross-cutting code is reused through internal libraries under `libs/`, consumed 
 5. `<acquirer-bank>-tx-service` detokenizes the card via `card-vault-service`, sends the request to the bank and publishes the result.
 6. The result event is consumed by `gateway-service` (state update, visible via polling), `notification-service` (vendor webhook), and `tid-assignment-service` (TID release).
 
-**Wallet variant**: Apple Pay / Google Pay operations are first consumed by `applepay-service` / `googlepay-service` (payload decryption — inside the service itself for Apple Pay, delegated to `card-vault-service` for Google Pay — plus wallet validation) and join the card rail at `card-transactions-service` from step 3 onwards. In step 5, `<acquirer-bank>-tx-service` detokenizes via `card-vault-service` for `CARD` and `GOOGLE_PAY` transactions; for `APPLE_PAY`, the `cardToken` is already the network-issued DPAN and is sent to the bank as-is, no vault call needed.
+**Wallet variant**: Apple Pay / Google Pay operations are first consumed by `applepay-service` / `googlepay-service` (payload decryption — inside the service itself for Apple Pay, delegated to `card-vault-service` for Google Pay — plus wallet validation) and join the card rail at `card-transactions-service` from step 3 onwards, with no 3DS step at all (see 3DS variant below). In step 5, `<acquirer-bank>-tx-service` detokenizes via `card-vault-service` for `CARD` and `GOOGLE_PAY` transactions; for `APPLE_PAY`, the `cardToken` is already the network-issued DPAN and is sent to the bank as-is, no vault call needed.
 
 **Stored-credential variant**: when a network token exists for the card (provisioned by `visa-token-service` / `mastercard-token-service` after the first authorization), `card-transactions-service` routes the operation through the network token instead of the vault token.
 
-**3DS variant (`authenticate`)**: an optional operation a vendor calls independently, ahead of `authorise`/`payment`, for 3DS liability-shift protection. `threeds-service` consumes it directly from the gateway — it never reaches `card-transactions-service`, `tid-assignment-service` or `<acquirer-bank>-tx-service`, since 3DS is resolved at the card scheme/issuer level, not the card rail. `threeds-service` detokenizes via `card-vault-service` and sends the authentication request to the card scheme's Directory Server. A frictionless result resolves immediately; a challenge result exposes a `challengeUrl` via polling, the vendor redirects the payer's browser there, and the issuer's ACS redirects it back to the gateway's public callback endpoint, which resumes processing. A subsequent `authorise`/`payment` referencing this transaction is processed by `card-transactions-service` as usual, which forwards the resulting authentication evidence to the acquirer.
+**3DS variant (`CARD` only — `APPLE_PAY`/`GOOGLE_PAY` never involve `threeds-service`)**:
+
+- `authenticate` is consumed directly by `threeds-service` from the gateway — it never reaches `card-transactions-service`, `tid-assignment-service` or `<acquirer-bank>-tx-service`, since 3DS is resolved at the card scheme/issuer level, not the card rail. `threeds-service` detokenizes via `card-vault-service` and sends the authentication request to the card scheme's Directory Server. A frictionless result resolves immediately; a challenge result exposes a `challengeUrl` via polling, the vendor redirects the payer's browser there, and the issuer's ACS redirects it back to the gateway's public callback endpoint, which resumes processing.
+- `authorise` **always** references a prior successful `authenticate` transaction: at step 3, once `card-transactions-service`'s own validation passes, it publishes the operation for `threeds-service` to validate and consume that reference (single-use) before continuing to TID assignment (step 4) — `authorise` never runs 3DS itself.
+- `payment` performs 3DS **as part of the same transaction**: at step 3, `card-transactions-service` publishes it for `threeds-service` to run the embedded 3DS step (frictionless or challenge, same mechanics as standalone `authenticate`); once `threeds-service` reports success, the same transaction continues to TID assignment (step 4) and onward, unlike `authorise`, which references a separately submitted `authenticate` rather than running 3DS inline.
+
+**Refund variant (`refund`)**: reverses an already-`SETTLED` `payment`. Runs through the same pipeline as any other operation (steps 3–6: `card-transactions-service` validates the original `payment` is `SETTLED` and belongs to the vendor, `tid-assignment-service` allocates a TID, `<acquirer-bank>-tx-service` sends the reversal to the bank) — a genuinely new, separately-settling money movement, unlike `void` (which prevents money from moving in the first place). On success, the original `payment` transitions to `REFUNDED`.
+
+> **Open concern (2026-07-13):** the active-database purge policy (see Data Lifecycle & Scalability) removes a `SETTLED` transaction once its operational window has expired and its presence in the historical store is verified. `refund` needs to validate against the *original* transaction (FR-O9), but real-world refunds can arrive well after that window. Whether `refund` validation reads from the active database (requiring `SETTLED` transactions to stay un-purged longer than today's policy implies) or from the historical store (a new cross-store read path not otherwise used by processing) is unresolved — needs a decision before `refund` is implemented.
 
 ### Transaction state machine (owned by gateway-service)
 
 ```
-REGISTERED → VALIDATED → TID_ASSIGNED → SENT_TO_ACQUIRER → AUTHORIZED | DECLINED | FAILED
-     │            │                                             │
-     └── REJECTED ┘                                             ├─► CAPTURED (payment: immediately)
-                                                                  └─► EXPIRED (authorise: no capture path in v1)
-CAPTURED ──► VOIDED   (follow-up: void)
-
-authenticate only (bypasses TID_ASSIGNED / SENT_TO_ACQUIRER):
+authenticate (CARD only, terminal — referenced by authorise, never continues):
 REGISTERED → VALIDATED → SENT_TO_THREEDS → AUTHORIZED | DECLINED | FAILED   (frictionless)
                                 │
                                 └─► CHALLENGE_REQUIRED → AUTHORIZED | DECLINED | FAILED (challenge, or timeout)
+
+authorise (CARD: requires a prior authenticate — no 3DS of its own):
+REGISTERED → VALIDATED → TID_ASSIGNED → SENT_TO_ACQUIRER → AUTHORIZED | DECLINED | FAILED
+     └── REJECTED                                               │
+                                                                  ├─► VOIDED   (via void)
+                                                                  └─► EXPIRED  (window elapsed, not voided)
+
+payment (CARD: 3DS embedded in the same transaction):
+REGISTERED → VALIDATED → SENT_TO_THREEDS → THREEDS_AUTHENTICATED → TID_ASSIGNED → SENT_TO_ACQUIRER → AUTHORIZED → CAPTURED
+                                │                                                                        │
+                                └─► CHALLENGE_REQUIRED → THREEDS_AUTHENTICATED (continues) | DECLINED | FAILED
+CAPTURED ──► VOIDED     (via void, before settlement cutoff)
+CAPTURED ──► SETTLED    (settlement batch confirmed)
+SETTLED  ──► REFUNDED   (via refund)
 ```
 
-`void` is currently the only follow-up operation (references the original transaction, only accepted when its state allows it). `cancel` and `deferred` capture are descoped for v1 — see Planned Extensions; until reintroduced, an `authorise` transaction can only resolve via `EXPIRED`. See the application requirements spec (`doc/specs/application-requirements.md`) for the full state table, including `EXPIRED` and `SETTLED`.
+`void` and `refund` are the follow-up operations (reference the original transaction, only accepted when its state allows it): `void` releases an unsettled `authorise`/`payment` (`cancel`'s old role, now folded in — see Planned Extensions for the descoped `cancel`/`deferred`); `refund` reverses an already-`SETTLED` `payment`. `APPLE_PAY`/`GOOGLE_PAY` `authorise`/`payment` follow the same diagrams with the 3DS-related states simply absent (no `authenticate` reference, no embedding). See the application requirements spec (`doc/specs/application-requirements.md`) for the full state table.
 
 ## Validation Strategy
 
@@ -375,7 +397,7 @@ Discussed and intentionally deferred:
 
 - **APM services** (`paypal-payments`, etc.) for redirect-based methods (PayPal, AmazonPay, AliPay) with a payment-only lifecycle.
 - **Hosted checkout**: register a transaction first (`REGISTERED` state, no method), then the payer completes it in a platform-hosted UI — keeps vendors out of PCI DSS scope. Requires session expiry and one-time UI tokens.
-- **`cancel` and `deferred` (capture)**: removed from v1 (2026-07-13) — to be reintroduced with different behavior than previously specified in this document. Until then, an `authorise` transaction has no capture/release path and can only resolve via `EXPIRED`.
+- **`cancel` and `deferred` (capture)**: removed from v1 (2026-07-13) — to be reintroduced with different behavior than previously specified in this document. `void` now covers releasing an unsettled `authorise` (`cancel`'s old role, 2026-07-13); `deferred` capture has no replacement yet.
 - **fraud-screening** service; its position in the chain (blocking pre-auth vs. post-auth analysis) is still to be decided.
 - **3DS / redirect challenge flows for APMs**: cards are covered in v1 via `authenticate` + `threeds-service` (see that section); extending the same challenge-redirect mechanism to APMs remains deferred.
 - **Internal BI/analytics tier** (e.g. Amazon Redshift) fed from the same Kafka events for long-range trend analysis — never used to serve backoffice queries.

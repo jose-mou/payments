@@ -33,51 +33,43 @@ A payments platform that lets registered vendors (merchants) accept card and wal
 
 All operations are submitted via the public API and processed asynchronously (§7). Operations are either **initial** (create a transaction) or **follow-up** (reference an existing transaction by id and are only accepted when the current state allows them — see §5).
 
+**Scope note (2026-07-13):** the `authenticate` ↔ `authorise`/`payment` relationship described below (FR-O1–FR-O3) applies to `CARD` only. `APPLE_PAY` and `GOOGLE_PAY` are exempt — the wallet's own device-level cardholder verification (biometrics/passcode + cryptogram) already fulfills what 3DS establishes for direct card entry, so their `authorise`/`payment` flow is unchanged (no reference to, or execution of, `authenticate`).
+
 ### Initial operations
 
-- **FR-O1 — `authenticate`**: performs EMV 3-D Secure (3DS) cardholder authentication via `threeds-service`, confirming with the card's issuer that the request originates from the legitimate cardholder, **without reserving or moving funds**. Optional: a vendor calls it independently, before an `authorise`/`payment`, when it wants 3DS liability-shift protection. Two possible outcomes, decided by the issuer (ARes):
+- **FR-O1 — `authenticate`** (`CARD` only): performs EMV 3-D Secure (3DS) cardholder authentication via `threeds-service`, confirming with the card's issuer that the request originates from the legitimate cardholder, **without reserving or moving funds** and without a specific amount (FR-O10) — it verifies the cardholder, independently of any particular `authorise` that may follow. Two possible outcomes, decided by the issuer (ARes):
   - **Frictionless** — the issuer authenticates silently; the operation resolves directly to a terminal outcome (`AUTHORIZED` / `DECLINED` / `FAILED`).
   - **Challenge** — the issuer requires cardholder interaction (OTP, biometric, etc.); the operation enters the non-terminal `CHALLENGE_REQUIRED` state (§5), exposing a `challengeUrl` (FR-D1) for the vendor to redirect the payer's browser to. Resolves to a terminal outcome once the payer completes the challenge, or `FAILED_CHALLENGE_TIMEOUT` if the challenge window elapses (default 10 minutes).
 
-  Not eligible for capture, void, or cancel. A successful `authenticate` produces authentication evidence (ECI, authentication value, `threeDsTransactionId`) that a subsequent `authorise`/`payment` can reference and forward to the acquirer (FR-O12).
-- **FR-O2 — `authorise`**: reserves funds on the card for the given amount without capturing them. Outcome `AUTHORIZED` reserves the funds; the reservation expires per acquirer rules (default validity window: 7 calendar days, configurable per vendor/acquirer) if not captured. **v1 note:** capturing or releasing an `authorise` (`deferred`, `cancel`) is not yet implemented (see below) — in this reduced scope, an `AUTHORIZED` `authorise` can only resolve to `EXPIRED`.
-- **FR-O3 — `payment`** (sale): authorization + capture in a single operation. Outcome `AUTHORIZED` is immediately followed by `CAPTURED` (single acquirer call; both state transitions recorded).
+  A successful (`AUTHORIZED`) `authenticate` transaction may be referenced by exactly one subsequent `authorise` (FR-O2, FR-O12) — it is not itself capturable, voidable, or refundable.
+- **FR-O2 — `authorise`**: reserves funds on the card for the given amount without capturing them. For `CARD`, **always references a prior successful `authenticate` transaction** (`threeDsAuthenticationId`, FR-D1) — the cardholder must already be 3DS-verified before funds can be reserved, so `authorise` never runs 3DS itself and skips straight to TID assignment (§5). The referenced `authenticate` transaction must (FR-O12): belong to the same vendor, be in state `AUTHORIZED`, not already referenced by another `authorise`, and be referenced within its validity window (default 15 minutes from authentication — reflecting typical 3DS session validity, shorter than `authorise`'s own reservation window below). Violations are rejected structurally (`400`) or as `REJECTED_INVALID_STATE`, per FR-A2. For `APPLE_PAY`/`GOOGLE_PAY`, no `authenticate` reference applies (scope note above). Outcome `AUTHORIZED` reserves the funds; the reservation has a validity window (default 7 calendar days, configurable per vendor/acquirer). In v1 (no `deferred` capture — see `Resolved`), an `AUTHORIZED` `authorise` resolves only via `void` (releasing it, FR-O6) or `EXPIRED` if neither voided nor otherwise resolved within its window.
+- **FR-O3 — `payment`** (sale): for `CARD`, performs 3DS authentication and authorization, followed by immediate capture, **all as part of the same transaction** — a single `transactionId`, not a reference to a separately submitted `authenticate` (contrast with `authorise`, FR-O2). Internally: `SENT_TO_THREEDS` → (`CHALLENGE_REQUIRED` →) `THREEDS_AUTHENTICATED` → `TID_ASSIGNED` → `SENT_TO_ACQUIRER` → `AUTHORIZED` → `CAPTURED` (§5). Requires `returnUrl` (FR-A8) for the same reason `authenticate` does: the issuer's frictionless-vs-challenge decision is unknown until the request is sent. For `APPLE_PAY`/`GOOGLE_PAY`, `payment` has no embedded 3DS step (scope note above): authorization + capture in a single acquirer call, as before.
 
 ### Follow-up operations
 
-- **FR-O6 — `void`**: reverses a captured, not-yet-settled `payment` — allowed only before the transaction is included in a settlement batch for its acquirer (cutoff, §9). Terminal state: `VOIDED`.
-
-> **Removed for v1 (2026-07-13):** `deferred` (capture) and `cancel`, previously `FR-O4`/`FR-O5`, are descoped — they will be reintroduced later with different behavior than previously specified here. The identifiers `FR-O4`/`FR-O5` are retired and must not be reused for unrelated requirements. See `Resolved` below.
+- **FR-O6 — `void`**: reverses a transaction that has **not yet been settled** — either an `authorise` still in state `AUTHORIZED` (releasing the reservation) or a `payment` in state `CAPTURED` but not yet included in a settlement batch for its acquirer (cutoff, §9). Terminal state: `VOIDED`.
+- **FR-O8 — `refund`**: reverses a `payment` that has **already been settled** — the post-settlement counterpart of `void` (FR-O6). Full amount only in v1 (partial refunds out of scope, §10). Unlike `void`, a `refund` is itself a new acquirer-facing money movement: it runs through the same pipeline as any other operation (validation → TID → acquirer, FR-O7) since funds must actually be returned rather than simply withheld, and settles in its own right, in the opposite direction (`settlement-service` models this — no file-format change needed). On success, the original transaction transitions `SETTLED` → `REFUNDED` (§5).
 - **FR-O7** — Follow-up operations run through the same asynchronous pipeline (validation → TID → acquirer) and are themselves recorded as operations linked to the original transaction.
-- **FR-O8** — Refunds (returning funds after settlement) are **out of scope for v1** (§10). `settlement-service` must nevertheless model money movement direction so refunds can be added without a file-format redesign.
+
+> **Removed for v1 (2026-07-13):** `deferred` (capture) and `cancel`, previously `FR-O4`/`FR-O5`, are descoped — `void` now covers releasing an unsettled `authorise` (FR-O6), which was `cancel`'s role. They may be reintroduced later with different behavior than previously specified here. The identifiers `FR-O4`/`FR-O5` are retired and must not be reused for unrelated requirements. See `Resolved` below.
 
 ### Cross-cutting operation rules
 
-- **FR-O9** — Every operation belongs to exactly one vendor; a vendor can only reference its own transactions (enforced from the JWT, returns `404` on foreign ids — never `403`, to avoid id-space probing).
-- **FR-O10** — Amounts are integers in **minor units** (e.g. cents); currency is **ISO 4217 alphabetic**. Zero/negative amounts are structurally invalid except `authenticate` (amount must be absent or zero).
+- **FR-O9** — Every operation belongs to exactly one vendor; a vendor can only reference its own transactions — including a referenced `authenticate` (FR-O2) or the original transaction for `void`/`refund` — enforced from the JWT, returns `404` on foreign ids (never `403`, to avoid id-space probing).
+- **FR-O10** — Amounts are integers in **minor units** (e.g. cents); currency is **ISO 4217 alphabetic**. Zero/negative amounts are structurally invalid except `authenticate`, which carries no amount at all (FR-O1).
 - **FR-O11** — Follow-up operations never carry card data; they reference the original transaction's token.
-- **FR-O12** — `authorise` and `payment` may optionally reference a prior successful `authenticate` transaction via `threeDsAuthenticationId` (FR-D1); when present, the authentication evidence produced by that transaction (ECI, authentication value, `threeDsTransactionId`) is forwarded to the acquirer with the authorization request, for 3DS liability-shift purposes.
+- **FR-O12** — For `CARD`, `authorise`'s reference to its prerequisite `authenticate` transaction (FR-O2) is **mandatory and single-use**: a given `authenticate` transaction may be referenced by at most one `authorise` (reuse attempts rejected, `409`). `payment` does not reference an external `authenticate` transaction — its embedded 3DS step (FR-O3) produces evidence used only for its own acquirer call, not shared with other transactions.
 
 ## 5. Transaction lifecycle
 
-State machine owned by `gateway-service` (authoritative; consistent with `ARCHITECTURE.md`):
+State machine owned by `gateway-service` (authoritative; consistent with `ARCHITECTURE.md`). `authenticate`, `authorise` and `payment` diverge from `VALIDATED` onward — each has its own path, shown below (`CARD`; see the scope note in §4 for `APPLE_PAY`/`GOOGLE_PAY`, which follow the `authorise`/`payment` diagrams with the 3DS-related states simply absent).
+
+### `authenticate`
+
+Verifies the cardholder via 3DS; never moves or reserves funds. Terminal here — a later `authorise` references it (FR-O2) but does not continue its state machine; it is not itself capturable, voidable, or refundable.
 
 ```
-REGISTERED ──► VALIDATED ──► TID_ASSIGNED ──► SENT_TO_ACQUIRER ──┬─► AUTHORIZED
-     │              │                                            ├─► DECLINED   (terminal)
-     └─► REJECTED   └─► REJECTED                                 └─► FAILED     (terminal)
-        (terminal)     (terminal)
-
-AUTHORIZED ──► CAPTURED     (payment: immediately — authorise has no capture path in v1, see FR-O2)
-AUTHORIZED ──► EXPIRED      (terminal — validity window elapsed, no capture)
-CAPTURED   ──► VOIDED       (terminal — via void, before settlement cutoff)
-CAPTURED   ──► SETTLED      (terminal — included in a confirmed settlement batch)
-```
-
-`authenticate` only — bypasses `TID_ASSIGNED` / `SENT_TO_ACQUIRER` (3DS is scheme-level, resolved by the card network's Directory Server and the issuer, not the acquirer bank):
-
-```
-REGISTERED ──► VALIDATED ──► SENT_TO_THREEDS ──┬─► AUTHORIZED   (frictionless)
+REGISTERED ──► VALIDATED ──► SENT_TO_THREEDS ──┬─► AUTHORIZED   (frictionless, terminal)
      │              │                          ├─► DECLINED     (terminal)
      └─► REJECTED   └─► REJECTED               ├─► FAILED       (terminal)
         (terminal)     (terminal)              └─► CHALLENGE_REQUIRED ──┬─► AUTHORIZED
@@ -86,25 +78,48 @@ REGISTERED ──► VALIDATED ──► SENT_TO_THREEDS ──┬─► AUTHORI
                                                                           └─► FAILED (challenge timeout)
 ```
 
-- **FR-L1** — Transitions and their triggers:
+### `authorise`
+
+For `CARD`, always references a prior successful `authenticate` (FR-O2) — 3DS is never repeated here; validation includes checking that reference (FR-O12), then the flow skips straight to TID assignment. (`APPLE_PAY`/`GOOGLE_PAY`: same diagram, no `authenticate` reference involved.)
+
+```
+REGISTERED ──► VALIDATED ──► TID_ASSIGNED ──► SENT_TO_ACQUIRER ──┬─► AUTHORIZED
+     │              │                                            ├─► DECLINED   (terminal)
+     └─► REJECTED   └─► REJECTED                                 └─► FAILED     (terminal)
+        (terminal)     (terminal)
+
+AUTHORIZED ──► VOIDED    (terminal — via void, releasing the reservation, FR-O6)
+AUTHORIZED ──► EXPIRED   (terminal — validity window elapsed, not voided)
+```
+
+### `payment`
+
+For `CARD`, performs 3DS authentication and authorization, then immediate capture, as part of the same transaction (FR-O3): `THREEDS_AUTHENTICATED` marks a successful embedded 3DS step (frictionless or post-challenge) before continuing to TID assignment. (`APPLE_PAY`/`GOOGLE_PAY`: no embedded 3DS — starts directly at `TID_ASSIGNED`.)
+
+```
+REGISTERED ──► VALIDATED ──► SENT_TO_THREEDS ──┬─► THREEDS_AUTHENTICATED ──► TID_ASSIGNED ──► SENT_TO_ACQUIRER ──┬─► AUTHORIZED ──► CAPTURED
+     │              │                          ├─► DECLINED (terminal)                                          ├─► DECLINED (terminal)
+     └─► REJECTED   └─► REJECTED               ├─► FAILED   (terminal)                                          └─► FAILED   (terminal)
+        (terminal)     (terminal)              └─► CHALLENGE_REQUIRED ──┬─► THREEDS_AUTHENTICATED (continues above)
+                                                                          ├─► DECLINED (terminal)
+                                                                          ├─► FAILED   (terminal)
+                                                                          └─► FAILED   (challenge timeout, terminal)
+
+CAPTURED ──► VOIDED     (terminal — via void, before settlement cutoff, FR-O6)
+CAPTURED ──► SETTLED    (settlement batch confirmed for its cutoff)
+SETTLED  ──► REFUNDED   (terminal — via refund, FR-O8)
+```
+
+- **FR-L1** — Notable transition triggers not fully evident from the diagrams above:
 
 | From | To | Trigger |
 |---|---|---|
-| — | `REGISTERED` | Gateway accepts the request (`202`) |
-| `REGISTERED` | `VALIDATED` | Method service business validation passes |
-| `REGISTERED`/`VALIDATED` | `REJECTED` | Business validation fails (method service) |
-| `VALIDATED` | `TID_ASSIGNED` | TID allocated for vendor/acquirer (not `authenticate`) |
-| `TID_ASSIGNED` | `SENT_TO_ACQUIRER` | Acquirer adapter sends the request |
-| `SENT_TO_ACQUIRER` | `AUTHORIZED` / `DECLINED` / `FAILED` | Acquirer result |
-| `VALIDATED` | `SENT_TO_THREEDS` | 3DS authentication request sent (`authenticate` only) |
-| `SENT_TO_THREEDS` | `AUTHORIZED` / `DECLINED` / `FAILED` | Frictionless issuer decision (ARes) |
-| `SENT_TO_THREEDS` | `CHALLENGE_REQUIRED` | Issuer requires cardholder challenge (ARes) |
-| `CHALLENGE_REQUIRED` | `AUTHORIZED` / `DECLINED` / `FAILED` | Challenge completed (issuer RRes via callback, FR-A9) |
-| `CHALLENGE_REQUIRED` | `FAILED` | Challenge window elapses without completion (default 10 min) |
-| `AUTHORIZED` | `CAPTURED` | Sale (`payment`) auto-capture |
-| `AUTHORIZED` | `EXPIRED` | Validity window elapses without capture (only path out of `AUTHORIZED` for `authorise` in v1) |
-| `CAPTURED` | `VOIDED` | Successful `void` before cutoff |
-| `CAPTURED` | `SETTLED` | Settlement batch confirmed for its cutoff |
+| `REGISTERED`/`VALIDATED` | `REJECTED` | Business validation fails (method service) — for `authorise` (`CARD`), this includes the referenced `authenticate` failing any check in FR-O12 (wrong vendor, not `AUTHORIZED`, already referenced, or reference expired) |
+| `CHALLENGE_REQUIRED` | terminal outcome / `THREEDS_AUTHENTICATED` | Issuer's challenge result (RRes) via the public callback (FR-A9), or `FAILED_CHALLENGE_TIMEOUT` if the challenge window elapses (default 10 minutes) |
+| `AUTHORIZED` (`authorise`) | `VOIDED` | Successful `void` (FR-O6) |
+| `CAPTURED` (`payment`) | `VOIDED` | Successful `void` before the settlement cutoff (FR-O6, FR-S2) |
+| `CAPTURED` | `SETTLED` | Settlement batch confirmed for its cutoff (FR-S1) |
+| `SETTLED` | `REFUNDED` | Successful `refund` (FR-O8) |
 
 - **FR-L2** — Every transition is recorded with a timestamp and the id of the causing event; the transition history is part of the canonical record (and of reporting).
 - **FR-L3** — A follow-up operation that fails (`DECLINED`/`FAILED`/`REJECTED`) does **not** change the state of the original transaction; the follow-up records its own outcome.
@@ -119,20 +134,20 @@ The minimal data set that identifies and describes a transaction platform-wide. 
 | Field | Notes |
 |---|---|
 | `transactionId` | UUID, assigned by the gateway; the platform-wide correlation id and Kafka partition key |
-| `operationType` | `AUTHENTICATE` \| `AUTHORISE` \| `PAYMENT` \| `VOID` |
+| `operationType` | `AUTHENTICATE` \| `AUTHORISE` \| `PAYMENT` \| `VOID` \| `REFUND` |
 | `originalTransactionId` | Present on follow-ups only |
 | `vendorId` | Owning vendor |
 | `vendorReference` | Vendor's own order/reference id (opaque string, ≤ 64 chars) |
 | `paymentMethod` | `CARD` \| `APPLE_PAY` \| `GOOGLE_PAY` |
-| `amount`, `currency` | Minor units + ISO 4217 (absent for `authenticate`) |
+| `amount`, `currency` | Minor units + ISO 4217. Absent for `authenticate` (FR-O1). For `void`/`refund`, always equal to the original transaction's amount (full-amount only, no partial in v1, FR-O6/FR-O8) |
 | `cardToken` | Opaque card identifier — **never** raw PAN. For `CARD` and `GOOGLE_PAY`: a `card-vault-service`-minted token. For `APPLE_PAY`: the wallet-issued network token (DPAN) itself, since the vault is not involved in that flow (FR-M2) |
 | `maskedCard` | BIN, last4, expiry month/year, scheme |
 | `networkTokenUsed` | Whether routing used a network token |
 | `acquirerId` | Resolved from vendor configuration |
 | `tid` | Terminal id, present from `TID_ASSIGNED` onward (not `authenticate`) |
-| `threeDsAuthenticationId` | Optional; links an `authorise`/`payment` to a prior successful `authenticate` transaction (FR-O12) |
-| `challengeUrl` | Present only while `state = CHALLENGE_REQUIRED`; URL the vendor redirects the payer's browser to |
-| `returnUrl` | Vendor-supplied at submission of `authenticate` (mandatory, FR-A8); where the platform redirects the browser once the challenge completes |
+| `threeDsAuthenticationId` | `CARD` `authorise` only: mandatory link to its prerequisite `authenticate` transaction (FR-O2, FR-O12). Not used by `payment`, which performs 3DS internally as part of the same transaction, nor by `APPLE_PAY`/`GOOGLE_PAY` |
+| `challengeUrl` | Present only while `state = CHALLENGE_REQUIRED` (`authenticate` or `CARD` `payment`); URL the vendor redirects the payer's browser to |
+| `returnUrl` | Vendor-supplied at submission of `authenticate` or `CARD` `payment` (mandatory, FR-A8); where the platform redirects the browser once a challenge completes |
 | `state` | Current lifecycle state (§5) |
 | `result` | Outcome detail (§8): platform result code + acquirer response code |
 | `createdAt`, `updatedAt` | UTC instants |
@@ -149,7 +164,7 @@ The minimal data set that identifies and describes a transaction platform-wide. 
 - **FR-A5** — Authentication: JWT per request, scoped to one vendor. Invalid/expired token → `401`; valid token but disabled vendor → structural rejection.
 - **FR-A6** — API is versioned under `/api/v1/`; breaking changes require a new version prefix.
 - **FR-A7** — While `state = CHALLENGE_REQUIRED`, the status response (FR-A3) includes `challengeUrl` (FR-D1) so the vendor can redirect the payer's browser to complete the 3DS challenge.
-- **FR-A8** — `returnUrl` is a **mandatory** field on `authenticate` requests (structural validation, extends FR-A2): the issuer's frictionless-vs-challenge decision cannot be predicted by the vendor at submission time, so it must always be supplied.
+- **FR-A8** — `returnUrl` is a **mandatory** field on `authenticate` requests and on `CARD` `payment` requests (structural validation, extends FR-A2): the issuer's frictionless-vs-challenge decision cannot be predicted by the vendor at submission time, so it must always be supplied. Not required for `authorise` (3DS already resolved via its referenced `authenticate`, FR-O2) nor for `APPLE_PAY`/`GOOGLE_PAY` `payment` (no embedded 3DS step).
 - **FR-A9** — The platform exposes a public, **unauthenticated** endpoint, `POST /api/v1/payments/{transactionId}/3ds-challenge-result`, that receives the issuer ACS's challenge-completion callback — a browser redirect as part of the EMV 3DS challenge flow, not a vendor-authenticated API call. It is validated against the pending challenge session opened when `CHALLENGE_REQUIRED` began (single-use, time-bound correlation token — see NFR-10), never the vendor JWT, and never carries card data. After processing, the platform redirects the browser to the vendor's `returnUrl`.
 
 ## 8. Business outcomes and result codes
@@ -171,12 +186,12 @@ The minimal data set that identifies and describes a transaction platform-wide. 
 
 - **FR-N1** — On every terminal outcome (and on `CAPTURED`), `notification-service` delivers a webhook to the vendor's configured callback URL carrying the canonical snapshot. Delivery is at-least-once with exponential-backoff retries and a dead-letter state visible in backoffice; vendors must treat notifications idempotently (by `transactionId` + state).
 - **FR-N2** — Webhooks are signed (HMAC with a per-vendor secret) so vendors can authenticate the origin.
-- **FR-S1** — Settlement: per acquirer, all money-moving operations (`CAPTURED` not `VOIDED`) of a cutoff window are written to that bank's settlement file and delivered over SFTP at the bank's cutoff time/timezone. Inclusion in a confirmed batch transitions the transaction to `SETTLED`.
-- **FR-S2** — The `void` window for a transaction closes when its settlement batch generation starts (per-bank cutoff); a `void` arriving later is rejected with `REJECTED_INVALID_STATE`.
+- **FR-S1** — Settlement: per acquirer, all money-moving operations (`CAPTURED` `payment`s not `VOIDED`, and successful `refund`s) of a cutoff window are written to that bank's settlement file and delivered over SFTP at the bank's cutoff time/timezone. Inclusion in a confirmed batch transitions a `payment` to `SETTLED`; a `refund` settles in the opposite direction and, on inclusion, transitions its original transaction to `REFUNDED` (§5).
+- **FR-S2** — The `void` window for a transaction closes when its settlement batch generation starts (per-bank cutoff); a `void` arriving later is rejected with `REJECTED_INVALID_STATE` (a `refund` is the correct operation past that point, FR-O8).
 
 ## 10. Out of scope (v1)
 
-Refunds; hosted checkout; APMs (PayPal, etc.); fraud screening; multi-capture; multi-currency settlement per vendor account; 3DS / redirect challenge flows **for APMs** (cards are covered in v1 via `authenticate` + `threeds-service`, §3–§7); **`deferred` (capture) and `cancel`** — descoped, to be reintroduced with different behavior than previously specified (see `Resolved`). In this reduced v1, `authorise` transactions can only resolve via `EXPIRED`. See `ARCHITECTURE.md` §Planned Extensions.
+Hosted checkout; APMs (PayPal, etc.); fraud screening; multi-capture; **partial refunds** (`refund`, FR-O8, is full-amount only in v1); multi-currency settlement per vendor account; 3DS / redirect challenge flows **for APMs** (cards are covered in v1 via `authenticate` + `threeds-service`, §3–§7); **`deferred` (capture) and `cancel`** — descoped, to be reintroduced with different behavior than previously specified (see `Resolved`; `void`, FR-O6, now covers releasing an unsettled `authorise`). See `ARCHITECTURE.md` §Planned Extensions.
 
 ## 11. Non-functional requirements
 
@@ -193,14 +208,14 @@ Refunds; hosted checkout; APMs (PayPal, etc.); fraud screening; multi-capture; m
 
 ## 12. Open questions for review
 
-1. **Refunds:** `ARCHITECTURE.md` (settlement section) mentions refunds among money-moving operations, but no refund operation exists in the gateway API. This spec declares refunds out of scope for v1 (FR-O8) — confirm, or add a `refund` operation now.
-2. **`EXPIRED` and `SETTLED` states:** added by this spec (not in the `ARCHITECTURE.md` diagram) because authorization expiry and settlement confirmation are real lifecycle facts. Confirm, and update `ARCHITECTURE.md` accordingly.
-3. **Peak factor (NFR-1):** 10× average is an assumption; adjust if traffic is spikier (e.g. retail events).
-4. **3DS mandate (FR-O1/FR-O12):** `authenticate` is modeled as optional (vendor chooses whether to call it). If a regulatory mandate (e.g. PSD2/SCA) should make it compulsory for certain transactions/regions, that rule needs to be added explicitly — out of scope for this pass.
-5. **`deferred`/`cancel` redesign:** descoped for v1 (see `Resolved`). Until they return, `authorise` is effectively a dead end (only resolves via `EXPIRED`) — confirm whether `authorise` should also be temporarily removed from the vendor-facing API rather than exposing an operation with no useful completion path.
+1. **Peak factor (NFR-1):** 10× average is an assumption; adjust if traffic is spikier (e.g. retail events).
+2. **`authenticate` reference validity window (FR-O2/FR-O12):** default 15 minutes for how long a successful `authenticate` may still be referenced by an `authorise`, chosen to reflect typical 3DS session validity — an assumption, no value was given; confirm or adjust.
+3. **`authenticate` carries no amount (FR-O1/FR-O10):** modeled as pure cardholder verification, independent of any specific `authorise` amount. Some EMV 3DS deployments tie authentication to the exact transaction amount instead (amount-specific AReq) — confirm this platform intentionally allows amount-agnostic authentication, or `authenticate` should gain its own `amount`/`currency` that must match the subsequent `authorise`.
+4. **`refund` full-amount-only (FR-O8):** modeled strictly "like a `void`" (§ description), i.e. no partial refunds in v1 (§10). Confirm, since partial refunds are also a common real-world requirement.
 
 ## Resolved
 
 - **Wallet decryption split (FR-M2/FR-M3, 2026-07-13):** confirmed that `applepay-service` decrypts payloads itself (no real PAN ever possible, per Apple's wallet spec) while `googlepay-service` always routes through `card-vault-service` regardless of the vendor's configured auth method, since Google Pay's `PAN_ONLY` mode can carry the real PAN. `ARCHITECTURE.md` updated accordingly (`applepay-service`, `googlepay-service`, `card-vault-service`, `vendor-service`, PCI DSS Compliance sections).
 - **`authenticate` = 3DS authentication, with challenge support (FR-O1/FR-O12, 2026-07-13):** confirmed `authenticate` performs EMV 3DS cardholder authentication via a new `threeds-service`, with full challenge-redirect support in v1 (not deferred, unlike the original `ARCHITECTURE.md` Planned Extensions note). Adds the `CHALLENGE_REQUIRED` state, `threeDsAuthenticationId` / `challengeUrl` / `returnUrl` fields, a public challenge-callback endpoint (FR-A9), and puts `threeds-service` in the PCI CDE (detokenizes to route the AReq to the card scheme's Directory Server). `ARCHITECTURE.md` updated (`threeds-service` section, CDE list, Planned Extensions, Payment Flow, Repository Layout, `bank-simulator-service`).
-- **`deferred` and `cancel` descoped from v1 (former FR-O4/FR-O5, 2026-07-13):** removed from this pass — will be reintroduced later with different behavior than previously specified (the earlier definitions, capture-an-authorise and release-an-authorise, are not carried forward as assumptions). The identifiers `FR-O4` and `FR-O5` are retired and must not be reused. Consequences applied: `void` (FR-O6) now only reverses `payment` captures (the `deferred` case removed); the `CANCELLED` state and its transition are removed from the lifecycle; `authorise` (FR-O2) can currently only resolve via `EXPIRED`, flagged as open question 5 above. `ARCHITECTURE.md` updated (`gateway-service` operation list, state machine diagram, Payment Flow follow-up note).
+- **`deferred` and `cancel` descoped from v1 (former FR-O4/FR-O5, 2026-07-13):** removed from this pass — will be reintroduced later with different behavior than previously specified. The identifiers `FR-O4` and `FR-O5` are retired and must not be reused.
+- **`authorise` always requires a prior `authenticate`; `payment` bundles both; `void` releases `authorise`; `refund` added (FR-O1–FR-O3, FR-O6, FR-O8, FR-O12, 2026-07-13):** for `CARD` only (`APPLE_PAY`/`GOOGLE_PAY` exempt — the wallet's own device-level cardholder verification already covers this, confirmed explicitly). `authorise` now mandatorily references a prior successful, unconsumed, unexpired `authenticate` transaction (single-use) and never runs 3DS itself. `payment` performs 3DS + authorization + capture as one transaction (new `THREEDS_AUTHENTICATED` state), not by referencing a separate `authenticate`. This resolves the `authorise` dead-end concern raised previously: `void` (FR-O6) now also releases an unsettled `AUTHORIZED` `authorise`, taking over `cancel`'s old role. `refund` (FR-O8, repurposing the FR-O8 slot previously marking refunds out of scope) reverses an already-`SETTLED` `payment`, symmetric to `void` but post-settlement, full-amount only, and itself a new acquirer-facing, separately-settling operation. New terminal state `REFUNDED` (`SETTLED` → `REFUNDED`). `SETTLED` is hereby confirmed as an intentional, real state (this message relies on it directly), resolving the earlier open question about it; `EXPIRED` remains as previously defined. `ARCHITECTURE.md` updated to match (gateway operation list, state machine, Payment Flow, Planned Extensions).
