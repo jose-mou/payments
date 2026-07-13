@@ -40,14 +40,14 @@ All operations are submitted via the public API and processed asynchronously (§
   - **Challenge** — the issuer requires cardholder interaction (OTP, biometric, etc.); the operation enters the non-terminal `CHALLENGE_REQUIRED` state (§5), exposing a `challengeUrl` (FR-D1) for the vendor to redirect the payer's browser to. Resolves to a terminal outcome once the payer completes the challenge, or `FAILED_CHALLENGE_TIMEOUT` if the challenge window elapses (default 10 minutes).
 
   Not eligible for capture, void, or cancel. A successful `authenticate` produces authentication evidence (ECI, authentication value, `threeDsTransactionId`) that a subsequent `authorise`/`payment` can reference and forward to the acquirer (FR-O12).
-- **FR-O2 — `authorise`**: reserves funds on the card for the given amount without capturing them. Outcome `AUTHORIZED` reserves the funds; the reservation expires per acquirer rules (default validity window: 7 calendar days, configurable per vendor/acquirer) if not captured.
+- **FR-O2 — `authorise`**: reserves funds on the card for the given amount without capturing them. Outcome `AUTHORIZED` reserves the funds; the reservation expires per acquirer rules (default validity window: 7 calendar days, configurable per vendor/acquirer) if not captured. **v1 note:** capturing or releasing an `authorise` (`deferred`, `cancel`) is not yet implemented (see below) — in this reduced scope, an `AUTHORIZED` `authorise` can only resolve to `EXPIRED`.
 - **FR-O3 — `payment`** (sale): authorization + capture in a single operation. Outcome `AUTHORIZED` is immediately followed by `CAPTURED` (single acquirer call; both state transitions recorded).
 
 ### Follow-up operations
 
-- **FR-O4 — `deferred`** (capture): captures a previous `authorise`. Allowed only when the referenced transaction is `AUTHORIZED` and within its validity window. Capture amount must be ≤ authorized amount (partial capture allowed, **at most one capture** per authorization — multi-capture is out of scope).
-- **FR-O5 — `cancel`**: releases a previous `authorise` that will not be captured. Allowed only in state `AUTHORIZED` (of an `authorise`). Terminal state: `CANCELLED`.
-- **FR-O6 — `void`**: reverses a captured, not-yet-settled money movement (`payment` or `deferred`) — allowed only before the transaction is included in a settlement batch for its acquirer (cutoff, §9). Terminal state: `VOIDED`.
+- **FR-O6 — `void`**: reverses a captured, not-yet-settled `payment` — allowed only before the transaction is included in a settlement batch for its acquirer (cutoff, §9). Terminal state: `VOIDED`.
+
+> **Removed for v1 (2026-07-13):** `deferred` (capture) and `cancel`, previously `FR-O4`/`FR-O5`, are descoped — they will be reintroduced later with different behavior than previously specified here. The identifiers `FR-O4`/`FR-O5` are retired and must not be reused for unrelated requirements. See `Resolved` below.
 - **FR-O7** — Follow-up operations run through the same asynchronous pipeline (validation → TID → acquirer) and are themselves recorded as operations linked to the original transaction.
 - **FR-O8** — Refunds (returning funds after settlement) are **out of scope for v1** (§10). `settlement-service` must nevertheless model money movement direction so refunds can be added without a file-format redesign.
 
@@ -68,8 +68,7 @@ REGISTERED ──► VALIDATED ──► TID_ASSIGNED ──► SENT_TO_ACQUIRER
      └─► REJECTED   └─► REJECTED                                 └─► FAILED     (terminal)
         (terminal)     (terminal)
 
-AUTHORIZED ──► CAPTURED     (payment: immediately; authorise: via deferred)
-AUTHORIZED ──► CANCELLED    (terminal — via cancel, authorise only)
+AUTHORIZED ──► CAPTURED     (payment: immediately — authorise has no capture path in v1, see FR-O2)
 AUTHORIZED ──► EXPIRED      (terminal — validity window elapsed, no capture)
 CAPTURED   ──► VOIDED       (terminal — via void, before settlement cutoff)
 CAPTURED   ──► SETTLED      (terminal — included in a confirmed settlement batch)
@@ -102,9 +101,8 @@ REGISTERED ──► VALIDATED ──► SENT_TO_THREEDS ──┬─► AUTHORI
 | `SENT_TO_THREEDS` | `CHALLENGE_REQUIRED` | Issuer requires cardholder challenge (ARes) |
 | `CHALLENGE_REQUIRED` | `AUTHORIZED` / `DECLINED` / `FAILED` | Challenge completed (issuer RRes via callback, FR-A9) |
 | `CHALLENGE_REQUIRED` | `FAILED` | Challenge window elapses without completion (default 10 min) |
-| `AUTHORIZED` | `CAPTURED` | Sale auto-capture or successful `deferred` |
-| `AUTHORIZED` | `CANCELLED` | Successful `cancel` |
-| `AUTHORIZED` | `EXPIRED` | Validity window elapses without capture |
+| `AUTHORIZED` | `CAPTURED` | Sale (`payment`) auto-capture |
+| `AUTHORIZED` | `EXPIRED` | Validity window elapses without capture (only path out of `AUTHORIZED` for `authorise` in v1) |
 | `CAPTURED` | `VOIDED` | Successful `void` before cutoff |
 | `CAPTURED` | `SETTLED` | Settlement batch confirmed for its cutoff |
 
@@ -121,7 +119,7 @@ The minimal data set that identifies and describes a transaction platform-wide. 
 | Field | Notes |
 |---|---|
 | `transactionId` | UUID, assigned by the gateway; the platform-wide correlation id and Kafka partition key |
-| `operationType` | `AUTHENTICATE` \| `AUTHORISE` \| `PAYMENT` \| `DEFERRED` \| `CANCEL` \| `VOID` |
+| `operationType` | `AUTHENTICATE` \| `AUTHORISE` \| `PAYMENT` \| `VOID` |
 | `originalTransactionId` | Present on follow-ups only |
 | `vendorId` | Owning vendor |
 | `vendorReference` | Vendor's own order/reference id (opaque string, ≤ 64 chars) |
@@ -178,7 +176,7 @@ The minimal data set that identifies and describes a transaction platform-wide. 
 
 ## 10. Out of scope (v1)
 
-Refunds; hosted checkout; APMs (PayPal, etc.); fraud screening; multi-capture; multi-currency settlement per vendor account; 3DS / redirect challenge flows **for APMs** (cards are covered in v1 via `authenticate` + `threeds-service`, §3–§7). See `ARCHITECTURE.md` §Planned Extensions.
+Refunds; hosted checkout; APMs (PayPal, etc.); fraud screening; multi-capture; multi-currency settlement per vendor account; 3DS / redirect challenge flows **for APMs** (cards are covered in v1 via `authenticate` + `threeds-service`, §3–§7); **`deferred` (capture) and `cancel`** — descoped, to be reintroduced with different behavior than previously specified (see `Resolved`). In this reduced v1, `authorise` transactions can only resolve via `EXPIRED`. See `ARCHITECTURE.md` §Planned Extensions.
 
 ## 11. Non-functional requirements
 
@@ -195,14 +193,14 @@ Refunds; hosted checkout; APMs (PayPal, etc.); fraud screening; multi-capture; m
 
 ## 12. Open questions for review
 
-1. **`void` vs `cancel` semantics (FR-O5/O6):** this spec defines `cancel` = release authorization, `void` = reverse unsettled capture. Confirm this matches the intended vendor-facing meaning, since `ARCHITECTURE.md` lists both without distinguishing them.
-2. **Refunds:** `ARCHITECTURE.md` (settlement section) mentions refunds among money-moving operations, but no refund operation exists in the gateway API. This spec declares refunds out of scope for v1 (FR-O8) — confirm, or add a `refund` operation now.
-3. **`EXPIRED` and `SETTLED` states:** added by this spec (not in the `ARCHITECTURE.md` diagram) because authorization expiry and settlement confirmation are real lifecycle facts. Confirm, and update `ARCHITECTURE.md` accordingly.
-4. **Partial capture (FR-O4):** allowed (≤ authorized amount, single capture). Confirm.
-5. **Peak factor (NFR-1):** 10× average is an assumption; adjust if traffic is spikier (e.g. retail events).
-6. **3DS mandate (FR-O1/FR-O12):** `authenticate` is modeled as optional (vendor chooses whether to call it). If a regulatory mandate (e.g. PSD2/SCA) should make it compulsory for certain transactions/regions, that rule needs to be added explicitly — out of scope for this pass.
+1. **Refunds:** `ARCHITECTURE.md` (settlement section) mentions refunds among money-moving operations, but no refund operation exists in the gateway API. This spec declares refunds out of scope for v1 (FR-O8) — confirm, or add a `refund` operation now.
+2. **`EXPIRED` and `SETTLED` states:** added by this spec (not in the `ARCHITECTURE.md` diagram) because authorization expiry and settlement confirmation are real lifecycle facts. Confirm, and update `ARCHITECTURE.md` accordingly.
+3. **Peak factor (NFR-1):** 10× average is an assumption; adjust if traffic is spikier (e.g. retail events).
+4. **3DS mandate (FR-O1/FR-O12):** `authenticate` is modeled as optional (vendor chooses whether to call it). If a regulatory mandate (e.g. PSD2/SCA) should make it compulsory for certain transactions/regions, that rule needs to be added explicitly — out of scope for this pass.
+5. **`deferred`/`cancel` redesign:** descoped for v1 (see `Resolved`). Until they return, `authorise` is effectively a dead end (only resolves via `EXPIRED`) — confirm whether `authorise` should also be temporarily removed from the vendor-facing API rather than exposing an operation with no useful completion path.
 
 ## Resolved
 
 - **Wallet decryption split (FR-M2/FR-M3, 2026-07-13):** confirmed that `applepay-service` decrypts payloads itself (no real PAN ever possible, per Apple's wallet spec) while `googlepay-service` always routes through `card-vault-service` regardless of the vendor's configured auth method, since Google Pay's `PAN_ONLY` mode can carry the real PAN. `ARCHITECTURE.md` updated accordingly (`applepay-service`, `googlepay-service`, `card-vault-service`, `vendor-service`, PCI DSS Compliance sections).
 - **`authenticate` = 3DS authentication, with challenge support (FR-O1/FR-O12, 2026-07-13):** confirmed `authenticate` performs EMV 3DS cardholder authentication via a new `threeds-service`, with full challenge-redirect support in v1 (not deferred, unlike the original `ARCHITECTURE.md` Planned Extensions note). Adds the `CHALLENGE_REQUIRED` state, `threeDsAuthenticationId` / `challengeUrl` / `returnUrl` fields, a public challenge-callback endpoint (FR-A9), and puts `threeds-service` in the PCI CDE (detokenizes to route the AReq to the card scheme's Directory Server). `ARCHITECTURE.md` updated (`threeds-service` section, CDE list, Planned Extensions, Payment Flow, Repository Layout, `bank-simulator-service`).
+- **`deferred` and `cancel` descoped from v1 (former FR-O4/FR-O5, 2026-07-13):** removed from this pass — will be reintroduced later with different behavior than previously specified (the earlier definitions, capture-an-authorise and release-an-authorise, are not carried forward as assumptions). The identifiers `FR-O4` and `FR-O5` are retired and must not be reused. Consequences applied: `void` (FR-O6) now only reverses `payment` captures (the `deferred` case removed); the `CANCELLED` state and its transition are removed from the lifecycle; `authorise` (FR-O2) can currently only resolve via `EXPIRED`, flagged as open question 5 above. `ARCHITECTURE.md` updated (`gateway-service` operation list, state machine diagram, Payment Flow follow-up note).

@@ -86,7 +86,7 @@ Sole custodian of raw card data.
 
 Public entry point of the platform (behind `pan-proxy-service`).
 
-- Exposes the vendor-facing REST API supporting the card operation types: `authenticate`, `authorise`, `payment` (sale), `void`, `cancel`, `deferred` (capture).
+- Exposes the vendor-facing REST API supporting the card operation types: `authenticate`, `authorise`, `payment` (sale), `void`. (`cancel` and `deferred` capture are descoped for v1 — see Planned Extensions.)
 - Processes **tokenized requests only** — raw PAN/CVV never reach the gateway, which keeps it and everything behind it out of PCI scope.
 - Authenticates every request with **JWT**, scoped per vendor — a vendor can only operate on its own transactions.
 - Performs **structural validation** (required fields, formats, amounts, currency, supported method, vendor active) and rejects invalid requests synchronously with `400`.
@@ -233,8 +233,9 @@ Cross-cutting code is reused through internal libraries under `libs/`, consumed 
 ```
 REGISTERED → VALIDATED → TID_ASSIGNED → SENT_TO_ACQUIRER → AUTHORIZED | DECLINED | FAILED
      │            │                                             │
-     └── REJECTED ┘                            (follow-up ops)  ├─► CAPTURED (deferred)
-                                                                └─► VOIDED / CANCELLED
+     └── REJECTED ┘                                             ├─► CAPTURED (payment: immediately)
+                                                                  └─► EXPIRED (authorise: no capture path in v1)
+CAPTURED ──► VOIDED   (follow-up: void)
 
 authenticate only (bypasses TID_ASSIGNED / SENT_TO_ACQUIRER):
 REGISTERED → VALIDATED → SENT_TO_THREEDS → AUTHORIZED | DECLINED | FAILED   (frictionless)
@@ -242,7 +243,7 @@ REGISTERED → VALIDATED → SENT_TO_THREEDS → AUTHORIZED | DECLINED | FAILED 
                                 └─► CHALLENGE_REQUIRED → AUTHORIZED | DECLINED | FAILED (challenge, or timeout)
 ```
 
-Follow-up operations (`void`, `cancel`, `deferred` capture) reference the original transaction and are only accepted when the current state allows them. See the application requirements spec (`doc/specs/application-requirements.md`) for the full state table, including `EXPIRED` and `SETTLED`.
+`void` is currently the only follow-up operation (references the original transaction, only accepted when its state allows it). `cancel` and `deferred` capture are descoped for v1 — see Planned Extensions; until reintroduced, an `authorise` transaction can only resolve via `EXPIRED`. See the application requirements spec (`doc/specs/application-requirements.md`) for the full state table, including `EXPIRED` and `SETTLED`.
 
 ## Validation Strategy
 
@@ -297,7 +298,7 @@ The cardholder data environment (CDE) is limited to: **`pan-proxy-service`, `car
 
 Target volume: **~5 million transactions per day**. The design separates the hot processing path from historical consultation with two stores:
 
-- **Active database (gateway)** — holds only in-flight transactions and those still within their operational window (eligible for void, cancel, deferred capture, or pending failure analysis). The transactions table is **partitioned by day**.
+- **Active database (gateway)** — holds only in-flight transactions and those still within their operational window (eligible for `void`, or pending failure analysis). The transactions table is **partitioned by day**.
 - **Historical/reporting store (Aurora PostgreSQL + OpenSearch)** — fed by `reporting-service` from the lifecycle events. This is where the backoffice reads; the active database never serves backoffice queries.
 
 Purge policy for the active database:
@@ -374,6 +375,7 @@ Discussed and intentionally deferred:
 
 - **APM services** (`paypal-payments`, etc.) for redirect-based methods (PayPal, AmazonPay, AliPay) with a payment-only lifecycle.
 - **Hosted checkout**: register a transaction first (`REGISTERED` state, no method), then the payer completes it in a platform-hosted UI — keeps vendors out of PCI DSS scope. Requires session expiry and one-time UI tokens.
+- **`cancel` and `deferred` (capture)**: removed from v1 (2026-07-13) — to be reintroduced with different behavior than previously specified in this document. Until then, an `authorise` transaction has no capture/release path and can only resolve via `EXPIRED`.
 - **fraud-screening** service; its position in the chain (blocking pre-auth vs. post-auth analysis) is still to be decided.
 - **3DS / redirect challenge flows for APMs**: cards are covered in v1 via `authenticate` + `threeds-service` (see that section); extending the same challenge-redirect mechanism to APMs remains deferred.
 - **Internal BI/analytics tier** (e.g. Amazon Redshift) fed from the same Kafka events for long-range trend analysis — never used to serve backoffice queries.
