@@ -23,10 +23,11 @@ A payments platform that lets registered vendors (merchants) accept card and wal
 ## 3. Payment methods
 
 - **FR-M1** — `CARD`: direct card payments (PAN + expiry + CVV, tokenized at the edge by `pan-proxy-service`).
-- **FR-M2** — `APPLE_PAY`: encrypted Apple Pay payment token, decrypted only inside `card-vault-service`, then processed on the card rail.
-- **FR-M3** — `GOOGLE_PAY`: same pattern as Apple Pay.
+- **FR-M2** — `APPLE_PAY`: encrypted Apple Pay payment token. The decrypted payload **never contains the real PAN** — it always carries a device-specific network token (DPAN) plus a single-use cryptogram; Apple's wallet specification has no "raw PAN" variant. `applepay-service` decrypts the payload itself (holding the Apple merchant identity certificate) and forwards the DPAN directly onto the card rail — `card-vault-service` is not involved in this flow.
+- **FR-M3** — `GOOGLE_PAY`: encrypted Google Pay payment token. Unlike Apple Pay, the decrypted content depends on the **card auth method the vendor is configured to accept** (Google Pay `allowedCardAuthMethods`): `CRYPTOGRAM_3DS` (device token + cryptogram, same shape as Apple Pay) or `PAN_ONLY` (the **real PAN**, still wallet-encrypted in transit). Because the same deployed `googlepay-service` may serve vendors configured either way, it never decrypts the payload itself: it always forwards the still-encrypted envelope to `card-vault-service`, which decrypts and tokenizes it regardless of which auth method it turns out to be, returning only a token. This removes any risk of a configuration bug routing a `PAN_ONLY` payload down a path that bypasses the vault.
 - **FR-M4** — Stored credential: when a network token exists for a card (provisioned after first authorization), subsequent operations on that card are routed through the network token. This is a routing concern, not a distinct vendor-facing method.
 - **FR-M5** — A vendor may only use payment methods enabled in its configuration (`vendor-service`); operations with a disabled method are rejected structurally (`400`).
+- **FR-M6** — For vendors enabling `GOOGLE_PAY`, `vendor-service` additionally stores the **allowed card auth method(s)** (`CRYPTOGRAM_3DS`, `PAN_ONLY`, or both). This setting only affects vendor-facing configuration and validation; it never changes where decryption happens (always `card-vault-service`, per FR-M3).
 
 ## 4. Operations
 
@@ -104,7 +105,7 @@ The minimal data set that identifies and describes a transaction platform-wide. 
 | `vendorReference` | Vendor's own order/reference id (opaque string, ≤ 64 chars) |
 | `paymentMethod` | `CARD` \| `APPLE_PAY` \| `GOOGLE_PAY` |
 | `amount`, `currency` | Minor units + ISO 4217 (absent for `authenticate`) |
-| `cardToken` | Vault token — **never** raw PAN |
+| `cardToken` | Opaque card identifier — **never** raw PAN. For `CARD` and `GOOGLE_PAY`: a `card-vault-service`-minted token. For `APPLE_PAY`: the wallet-issued network token (DPAN) itself, since the vault is not involved in that flow (FR-M2) |
 | `maskedCard` | BIN, last4, expiry month/year, scheme |
 | `networkTokenUsed` | Whether routing used a network token |
 | `acquirerId` | Resolved from vendor configuration |
@@ -113,7 +114,7 @@ The minimal data set that identifies and describes a transaction platform-wide. 
 | `result` | Outcome detail (§8): platform result code + acquirer response code |
 | `createdAt`, `updatedAt` | UTC instants |
 
-- **FR-D2** — Raw PAN, CVV, decrypted wallet payloads, and DPANs must **never** appear in this model, in any event, log, or API response. Card data outside `card-vault-service` is restricted to token + masked fields.
+- **FR-D2** — Raw PAN, CVV, and full decrypted wallet payloads (beyond the DPAN + cryptogram, `APPLE_PAY` only) must **never** appear in this model, in any event, log, or API response outside `card-vault-service`. A DPAN is exempt from this restriction and may appear as `cardToken` (FR-D1) for `APPLE_PAY`: it is a network-issued, device- and merchant-scoped, single-use token with no path back to the real PAN outside the card network, and is safe to route through the platform's internal Kafka topics under the same handling as any other token. Card data outside `card-vault-service` is otherwise restricted to token + masked fields.
 - **FR-D3** — `transactionId` is the Kafka partition key for all transaction lifecycle events, guaranteeing per-transaction ordering.
 
 ## 7. Public API behavior
@@ -171,3 +172,7 @@ Refunds; hosted checkout; 3DS / redirect challenge flows; APMs (PayPal, etc.); f
 4. **`EXPIRED` and `SETTLED` states:** added by this spec (not in the `ARCHITECTURE.md` diagram) because authorization expiry and settlement confirmation are real lifecycle facts. Confirm, and update `ARCHITECTURE.md` accordingly.
 5. **Partial capture (FR-O4):** allowed (≤ authorized amount, single capture). Confirm.
 6. **Peak factor (NFR-1):** 10× average is an assumption; adjust if traffic is spikier (e.g. retail events).
+
+## Resolved
+
+- **Wallet decryption split (FR-M2/FR-M3, 2026-07-13):** confirmed that `applepay-service` decrypts payloads itself (no real PAN ever possible, per Apple's wallet spec) while `googlepay-service` always routes through `card-vault-service` regardless of the vendor's configured auth method, since Google Pay's `PAN_ONLY` mode can carry the real PAN. `ARCHITECTURE.md` updated accordingly (`applepay-service`, `googlepay-service`, `card-vault-service`, `vendor-service`, PCI DSS Compliance sections).

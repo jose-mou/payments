@@ -24,11 +24,12 @@ Payments App is a payments management platform built as a set of event-driven mi
 
 ┌────────────────────┐  tokenize ◄── pan-proxy-service │ detokenize ◄── <acquirer-bank>-tx-service
 │ card-vault-service │  sole store of encrypted PAN; CVV transient (short TTL)
-└────────────────────┘  wallet payload decryption (Apple/Google certs) — DPAN never leaves
+└────────────────────┘  Google Pay payload decryption (Google certs) — always, any auth method
 
-┌──────────────────┐  ┌───────────────────┐  decrypt via card-vault-service, then join the
-│ applepay-service │  │ googlepay-service │  card rail at card-transactions-service
-└──────────────────┘  └───────────────────┘  (dev: applepay/googlepay-simulator-service)
+┌──────────────────┐  ┌───────────────────┐  applepay: decrypts itself (own cert), DPAN never
+│ applepay-service │  │ googlepay-service │  is real PAN. googlepay: never decrypts, always
+└──────────────────┘  └───────────────────┘  via vault. Both join the card rail at
+                                              card-transactions-service (dev: *-simulator-service)
 
 ┌────────────────────┐  ┌──────────────────────────┐  network tokens (VTS/MDES) provisioned
 │ visa-token-service │  │ mastercard-token-service │  after first authorization, used for
@@ -72,7 +73,7 @@ Sole custodian of raw card data.
 
 - Stores the PAN encrypted with HSM/KMS-managed keys and issues the token used everywhere else in the platform.
 - Holds the CVV only transiently (encrypted, short TTL, pre-authorization) and deletes it irrecoverably once the authorization completes. The CVV is never persisted anywhere else.
-- Decrypts Apple Pay / Google Pay encrypted payloads — it holds the wallet payment-processing certificates — and returns the internal token for the DPAN, which never leaves the vault.
+- Decrypts Google Pay encrypted payloads — it holds the Google wallet payment-processing certificates — and tokenizes whatever it decrypts, whether that is a device network token (DPAN, `CRYPTOGRAM_3DS` auth method) or the real PAN (`PAN_ONLY` auth method): `googlepay-service` always forwards the still-encrypted envelope and never decrypts it itself, so the same code path is used regardless of the vendor's configured auth method — removing any risk of a real PAN bypassing the vault due to a configuration bug. Apple Pay payloads never carry a real PAN (Apple's wallet specification has no `PAN_ONLY` equivalent) and are decrypted directly by `applepay-service`, which holds its own Apple merchant identity certificate; the vault is not involved in that flow.
 - Exposes detokenization exclusively to the `<acquirer-bank>-tx-service`, `visa-token-service` and `mastercard-token-service` services (mTLS + service allowlist, audited).
 
 ### gateway-service
@@ -88,7 +89,7 @@ Public entry point of the platform (behind `pan-proxy-service`).
 
 ### vendor-service
 
-Manages the vendors (merchants/providers) registered on the platform: onboarding, credentials, configuration (enabled payment methods, acquirer bank, TID pool size). Publishes vendor lifecycle events so other services (gateway, tid-assignment-service) can keep local replicas of the configuration they need.
+Manages the vendors (merchants/providers) registered on the platform: onboarding, credentials, configuration (enabled payment methods, acquirer bank, TID pool size, and — for vendors enabling `GOOGLE_PAY` — the allowed card auth method(s): `CRYPTOGRAM_3DS`, `PAN_ONLY`, or both). Publishes vendor lifecycle events so other services (gateway, tid-assignment-service) can keep local replicas of the configuration they need.
 
 ### card-transactions-service
 
@@ -104,14 +105,14 @@ Card processing entry point: direct card payments, card-rail operations handed o
 Apple Pay payments logic.
 
 - Consumes Apple Pay operations published by the gateway. The Apple payment token travels **encrypted end-to-end** — `pan-proxy-service` passes it through untouched (no raw PAN in the payload).
-- Delegates payload decryption to `card-vault-service` (holder of the Apple payment-processing certificates), receiving back the internal token for the DPAN — this keeps the service **out of PCI scope**.
-- Validates the wallet operation (cryptogram, expiry, amount consistency) and publishes it as a card-rail operation consumed by `card-transactions-service`; from there the standard card flow applies (validation, TID, acquirer).
+- Decrypts the payload itself, holding its own Apple merchant identity certificate. Apple's wallet specification guarantees the decrypted content is never the real PAN — always a device-specific network token (DPAN) plus a single-use cryptogram — so `card-vault-service` is **not involved** in this flow, and the service stays **out of PCI scope** by protocol guarantee rather than by delegation.
+- Validates the wallet operation (cryptogram, expiry, amount consistency) and publishes it as a card-rail operation consumed by `card-transactions-service`, carrying the DPAN as the transaction's `cardToken`; from there the standard card flow applies (validation, TID, acquirer).
 
 `applepay-simulator-service` (development only) simulates Apple's payloads and responses in the development environment.
 
 ### googlepay-service
 
-Google Pay equivalent of `applepay-service`: same pattern — encrypted wallet payload passed through untouched, decryption delegated to `card-vault-service`, wallet validation, then hand-off to the card rail. `googlepay-simulator-service` (development only) simulates Google's responses.
+Consumes Google Pay operations published by the gateway; the wallet payload passes through `pan-proxy-service` untouched, same as Apple Pay. Unlike `applepay-service`, it **never decrypts the payload itself**: depending on the vendor's configured card auth method (`vendor-service`), the decrypted content may be a device network token (`CRYPTOGRAM_3DS`) or the **real PAN** (`PAN_ONLY`), so `googlepay-service` always forwards the still-encrypted envelope to `card-vault-service`, which decrypts and tokenizes it regardless of which case it turns out to be, returning only a token. This single code path — never branching on vendor configuration — keeps `googlepay-service` **out of PCI scope** and removes any risk of a configuration bug routing a real PAN outside the vault. From there: wallet validation, then hand-off to the card rail carrying the vault token as `cardToken`. `googlepay-simulator-service` (development only) simulates Google's responses.
 
 ### visa-token-service / mastercard-token-service
 
@@ -200,7 +201,7 @@ Cross-cutting code is reused through internal libraries under `libs/`, consumed 
 5. `<acquirer-bank>-tx-service` detokenizes the card via `card-vault-service`, sends the request to the bank and publishes the result.
 6. The result event is consumed by `gateway-service` (state update, visible via polling), `notification-service` (vendor webhook), and `tid-assignment-service` (TID release).
 
-**Wallet variant**: Apple Pay / Google Pay operations are first consumed by `applepay-service` / `googlepay-service` (payload decryption via `card-vault-service`, wallet validation) and join the card rail at `card-transactions-service` from step 3 onwards.
+**Wallet variant**: Apple Pay / Google Pay operations are first consumed by `applepay-service` / `googlepay-service` (payload decryption — inside the service itself for Apple Pay, delegated to `card-vault-service` for Google Pay — plus wallet validation) and join the card rail at `card-transactions-service` from step 3 onwards. In step 5, `<acquirer-bank>-tx-service` detokenizes via `card-vault-service` for `CARD` and `GOOGLE_PAY` transactions; for `APPLE_PAY`, the `cardToken` is already the network-issued DPAN and is sent to the bank as-is, no vault call needed.
 
 **Stored-credential variant**: when a network token exists for the card (provisioned by `visa-token-service` / `mastercard-token-service` after the first authorization), `card-transactions-service` routes the operation through the network token instead of the vault token.
 
@@ -254,7 +255,8 @@ The cardholder data environment (CDE) is limited to: **`pan-proxy-service`, `car
 - PAN at rest exists only in `card-vault-service`, encrypted with HSM/KMS-managed keys.
 - CVV is never stored beyond authorization: transient in the vault with a short TTL and irrecoverably deleted once the authorization completes. It is never written to Kafka — topic retention counts as storage under PCI DSS.
 - Detokenization happens only at the last hop before an external network — bank adapters and the network token services (provisioning requires the real PAN) — restricted by mTLS and a service allowlist, and audited.
-- Wallet payloads (Apple Pay / Google Pay) are decrypted **inside** `card-vault-service`, which holds the payment-processing certificates; the decrypted DPAN never leaves the vault, keeping `applepay-service` and `googlepay-service` out of scope.
+- **Google Pay** payloads are decrypted **inside** `card-vault-service`, which holds the Google wallet payment-processing certificates; `googlepay-service` never decrypts the payload itself (regardless of the vendor's configured card auth method), which is what keeps it out of scope — see `googlepay-service`.
+- **Apple Pay** payloads are decrypted by `applepay-service` itself, **outside** the vault: Apple's wallet specification guarantees the decrypted content is never the real PAN (always a DPAN + cryptogram), so no cardholder data ever reaches the service — it stays out of scope by protocol guarantee, not by delegation. See `applepay-service`.
 - `settlement-service` joins the CDE only if a bank's settlement file format requires the full PAN (batch detokenization at file generation); with token/masked formats it stays out of scope.
 - Baseline hygiene everywhere: TLS/mTLS in transit, encryption at rest for brokers and databases, and no card data in logs.
 
