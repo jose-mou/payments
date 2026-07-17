@@ -1,6 +1,6 @@
 # Event Catalog Specification
 
-- **Status:** Draft — pending review
+- **Status:** Approved — reviewed 2026-07-17
 - **Date:** 2026-07-17
 - **Scope:** The concrete Kafka event contracts of the platform: serialization, envelope, canonical payload, topic catalog (producer, trigger, key, consumers), and schema-evolution rules. Derived from `doc/specs/application-requirements.md` (behavior — FR-*/NFR-* referenced throughout) and `doc/ARCHITECTURE.md` (structure). Where this document names a field or state, the requirements spec is the source of truth for its meaning.
 - **References:** `doc/specs/application-requirements.md`, `doc/ARCHITECTURE.md`.
