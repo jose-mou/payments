@@ -1,6 +1,6 @@
 # Application Requirements Specification
 
-- **Status:** Draft — pending review
+- **Status:** Approved — reviewed 2026-07-17
 - **Date:** 2026-07-17
 - **Scope:** Platform-wide functional and non-functional requirements. This document defines *what* the platform does: operations, transaction lifecycle, canonical data model, business outcomes, and the constraints that shape all contracts. It deliberately does not define per-service internals (covered by per-service specs) nor concrete event schemas (covered by the event catalog spec, `doc/specs/event-catalog.md`, which is derived from this document).
 - **References:** `doc/ARCHITECTURE.md` (how the platform is structured), `doc/specs/event-catalog.md` (concrete event contracts derived from this document). Where this document and the architecture overlap, the architecture governs structure and this document governs behavior.
