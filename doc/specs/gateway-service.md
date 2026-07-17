@@ -13,19 +13,18 @@ Public entry point and **owner of the canonical payment record and state machine
 
 All endpoints are versioned under `/api/v1`, JWT-authenticated per vendor (FR-A5, JWKS from `vendor-service`) except where noted. Reached through `pan-proxy-service`.
 
-### 2.1 Submit operation — `POST /api/v1/payments`
+### 2.1 Submit initial operation — `POST /api/v1/payments`
 
-One endpoint for all operation types, discriminated by `operationType` (mirrors the canonical model, FR-D1; see open question 1 for the per-operation alternative). Mandatory `Idempotency-Key` header (FR-A4).
+Creates `AUTHENTICATE`, `AUTHORISE` or `PAYMENT` transactions, discriminated by `operationType`. Follow-ups are **sub-resources of the original transaction** (§2.2) — decided 2026-07-17, aligning with prevailing PSP API practice (Adyen `/payments/{ref}/refunds`, Stripe PaymentIntent actions + Refunds, Braintree per-operation mutations) instead of a single endpoint for all five types. Mandatory `Idempotency-Key` header (FR-A4).
 
-Request body (per-type mandatory fields per FR-O1–FR-O8, FR-A8):
+Request body (per-type mandatory fields per FR-O1–FR-O3, FR-A8):
 
 | Field | Required for |
 |---|---|
-| `operationType` | all — `AUTHENTICATE` \| `AUTHORISE` \| `PAYMENT` \| `VOID` \| `REFUND` |
-| `vendorReference` | all initial operations |
-| `amount`, `currency` | all except `VOID` (whose amount is implicitly the original's, FR-D1) |
-| `paymentMethod` + method payload (card data / wallet token) | initial operations only (FR-O11). Card fields arrive already tokenized by `pan-proxy-service` |
-| `originalTransactionId` | `VOID`, `REFUND` |
+| `operationType` | all — `AUTHENTICATE` \| `AUTHORISE` \| `PAYMENT` |
+| `vendorReference` | all |
+| `amount`, `currency` | all |
+| `paymentMethod` + method payload (card data / wallet token) | all. Card fields arrive already tokenized by `pan-proxy-service` |
 | `threeDsAuthenticationId` | `CARD` `AUTHORISE` (FR-O2) |
 | `returnUrl` | `AUTHENTICATE`, `CARD` `PAYMENT` (FR-A8) |
 | `threeDsPreference` | optional on `AUTHENTICATE` / `CARD` `PAYMENT` (FR-O13) |
@@ -33,19 +32,28 @@ Request body (per-type mandatory fields per FR-O1–FR-O8, FR-A8):
 Responses:
 - `202 Accepted` + `Location: /api/v1/payments/{transactionId}`; body `{ transactionId, notificationSecret }` (FR-A10) — the only transmission of the secret ever.
 - `400` structural validation failure: machine-readable error list `[{ field, code, message }]` (FR-A2).
-- `401` invalid/expired JWT; `404` foreign `originalTransactionId`/`threeDsAuthenticationId` (FR-O9 — never `403`); `409` idempotency-key reuse with different payload (FR-A4).
+- `401` invalid/expired JWT; `404` foreign/unknown `threeDsAuthenticationId` (FR-O9 — never `403`); `409` idempotency-key reuse with different payload (FR-A4).
+
+### 2.2 Follow-up operations — `POST /api/v1/payments/{transactionId}/voids` · `POST /api/v1/payments/{transactionId}/refunds`
+
+Create a `VOID` / `REFUND` transaction against the original identified in the path — a follow-up without an original is impossible by construction, and FR-O9's `404` on foreign/unknown ids falls out naturally. Follow-ups never carry card data (FR-O11) and pass through `pan-proxy-service` untouched. Mandatory `Idempotency-Key` header.
+
+- `voids`: empty body — full amount, at most once (FR-O6).
+- `refunds`: body `{ amount }` — minor units, ≤ remaining unrefunded amount (business-validated downstream, FR-O8); currency is the original's (FR-O10 zero/negative rejected structurally). Multiple refunds are naturally modeled as the growing sub-collection.
+
+Responses: same contract as §2.1 (`202` + `Location` and `{ transactionId, notificationSecret }` for the new follow-up transaction; `400`/`401`/`409`; `404` when `{transactionId}` is unknown or foreign).
 
 Structural validation (synchronous, complete list — anything beyond this is business validation and happens downstream): required fields and formats per type; amount > 0 integer minor units + ISO 4217 currency (FR-O10); method enabled for vendor and vendor `ACTIVE` (FR-M5, from the local vendor replica); referenced transaction exists and belongs to the vendor (FR-O9); `returnUrl`/`webhookUrl` well-formed `https`.
 
-### 2.2 Status polling — `GET /api/v1/payments/{transactionId}`
+### 2.3 Status polling — `GET /api/v1/payments/{transactionId}`
 
 Returns the canonical snapshot (FR-D1 minus `notificationSecret`, which never appears — FR-A10), including `challengeUrl` while `CHALLENGE_REQUIRED` (FR-A7). Served from read replicas (staleness ≤ ~1 s acceptable, FR-A3). `404` on foreign/unknown ids (FR-O9).
 
-### 2.3 Challenge callback — `POST /api/v1/payments/{transactionId}/3ds-challenge-result` (public, unauthenticated)
+### 2.4 Challenge callback — `POST /api/v1/payments/{transactionId}/3ds-challenge-result` (public, unauthenticated)
 
 Receives the ACS browser redirect (FR-A9). Validates the single-use, time-bound challenge-session correlation token (NFR-10; missing/expired/reused → rejected, state unchanged), publishes `threeds-challenge.callback-received`, and redirects the browser (`303`) to the transaction's `returnUrl` with outcome parameters signed with the transaction's `notificationSecret` (FR-A9/FR-N2).
 
-### 2.4 Internal API — `GET /internal/v1/vendors/{vendorId}/non-terminal-count`
+### 2.5 Internal API — `GET /internal/v1/vendors/{vendorId}/non-terminal-count`
 
 Internal-only (mTLS, service allowlist — never exposed through `pan-proxy-service`): returns the number of non-terminal transactions for a vendor, read from the primary. Sole consumer: `vendor-service`, to gate `acquirerId` changes (its spec §3 — a justified synchronous exception, decided 2026-07-17).
 
@@ -94,6 +102,9 @@ Own PostgreSQL:
 
 ## 9. Open questions for review
 
-1. **Endpoint shape:** single `POST /api/v1/payments` with `operationType` (chosen — mirrors the canonical model and keeps `pan-proxy-service` dumb) vs. per-operation endpoints (`POST /payments/{id}/refunds`, more conventional REST, self-documenting). Affects the public contract — decide before implementation freezes it.
-2. **Vendor replica staleness at acceptance:** a vendor disabled milliseconds ago may still pass structural validation here (replica lag). Downstream re-validation (FR-L4) catches it, but the vendor receives a `202` for an operation that will be rejected — acceptable, or should submission double-check replica freshness? (v1 position: acceptable — document it.)
-3. **`vendorReference` uniqueness:** FR-D1 treats it as opaque; should the platform enforce per-vendor uniqueness (helps vendors' reconciliation, costs an index and a `409` path)? v1 position: not enforced.
+1. **Vendor replica staleness at acceptance:** a vendor disabled milliseconds ago may still pass structural validation here (replica lag). Downstream re-validation (FR-L4) catches it, but the vendor receives a `202` for an operation that will be rejected — acceptable, or should submission double-check replica freshness? (v1 position: acceptable — document it.)
+2. **`vendorReference` uniqueness:** FR-D1 treats it as opaque; should the platform enforce per-vendor uniqueness (helps vendors' reconciliation, costs an index and a `409` path)? v1 position: not enforced.
+
+## Resolved
+
+- **Endpoint shape (§2.1–§2.2, 2026-07-17):** hybrid, following prevailing PSP practice (Adyen Checkout sub-resource modifications, Stripe PaymentIntent actions + Refunds resource, Braintree per-operation mutations): `POST /api/v1/payments` creates initial operations only (`AUTHENTICATE`/`AUTHORISE`/`PAYMENT`, discriminated by `operationType`), while follow-ups are sub-resources of the original transaction (`POST /api/v1/payments/{id}/voids`, `POST /api/v1/payments/{id}/refunds`) — a follow-up without an original is impossible by construction, FR-O9's `404` falls out naturally, and repeatable partial refunds read as a growing sub-collection. Replaces the earlier single-endpoint-for-all-five-types draft.
