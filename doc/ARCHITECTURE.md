@@ -98,7 +98,7 @@ Public entry point of the platform (behind `pan-proxy-service`).
 - Performs **structural validation** (required fields, formats, amounts, currency, supported method, vendor active) and rejects invalid requests synchronously with `400`.
 - Persists the transaction and its domain event atomically (outbox + Debezium) and responds `202 Accepted` with a `Location` header pointing to the status endpoint (`GET /api/v1/payments/{id}`).
 - Owns the **canonical payment record and state machine**, updated by consuming result events from the processing services.
-- Exposes a public, **unauthenticated** 3DS challenge-callback endpoint (`POST /api/v1/payments/{id}/3ds-challenge-result`) — hit by the payer's browser redirected back from the issuer's ACS, not by the vendor — which relays the result to `threeds-service` and then redirects the browser to the vendor's `returnUrl`. Passes through `pan-proxy-service` untouched, like any request without card data.
+- Exposes a public, **unauthenticated** 3DS challenge-callback endpoint (`POST /api/v1/payments/{id}/3ds-challenge-result`) — hit by the payer's browser redirected back from the issuer's ACS, not by the vendor — which relays the result to `threeds-service` and then redirects the browser to the vendor's `returnUrl` with outcome parameters signed using the transaction's derived notification secret (application requirements FR-A9/FR-N2). Passes through `pan-proxy-service` untouched, like any request without card data.
 
 ### vendor-service
 
@@ -178,7 +178,7 @@ Code reuse across adapters comes from the shared `bank-adapter-starter` library 
 
 ### notification-service
 
-Notifies the vendor of the final result of each operation (webhook to the vendor's configured callback URL), consuming rejection and result events.
+Notifies the vendor of the final result of each operation (webhook to the vendor's configured callback URL), consuming rejection and result events. Webhooks are HMAC-signed with a **per-transaction derived secret** (returned to the vendor at registration; re-derived here from a shared KMS master key — no per-vendor webhook secrets exist and no secret ever travels on Kafka; see application requirements FR-N2/FR-A10/NFR-12).
 
 ### settlement-service
 
@@ -287,8 +287,8 @@ Validation is layered so that fast feedback does not require synchronous couplin
 
 - The default mechanism for service-to-service communication.
 - Events are past-tense facts (`payment.authorised`), published through the transactional outbox.
-- Topic naming: `<service-name>.<entity>.<event>` (e.g. `card-transactions-service.card-payment.rejected`).
-- Events are the public contract of a service: versioned, backward compatible.
+- Topic naming: `<service-name>.<entity>.<event>` (e.g. `card-transactions-service.card-operation.rejected`).
+- Events are the public contract of a service: versioned, backward compatible. The full topic catalog and Avro schema rules live in the event catalog spec (`doc/specs/event-catalog.md`).
 - Consumers are idempotent — the same event may be delivered more than once.
 
 ## Event Payload Strategy
@@ -296,7 +296,7 @@ Validation is layered so that fast feedback does not require synchronous couplin
 Events carry the **full transaction data** (event-carried state transfer), not just an ID:
 
 - Consumers never call back to the gateway to fetch transaction data — no synchronous coupling, no query storm at 5M transactions/day, and the stream is self-contained (replays, new consumers, rebuilding projections).
-- Event schemas are managed in a **schema registry** (Avro or Protobuf) with mandatory backward compatibility — with full payloads, every consumer depends on the event contract.
+- Event schemas are managed in a **schema registry** (**Avro** — decided 2026-07-17, see `doc/specs/event-catalog.md`) with mandatory backward compatibility — with full payloads, every consumer depends on the event contract.
 - An event is an **immutable snapshot** at publication time, never current state — which is why every service re-validates state on consumption.
 - Card data in events is restricted to **token + masked fields** (BIN, last4, expiry). Raw PAN and CVV are never published to Kafka (see PCI DSS Compliance).
 

@@ -56,7 +56,7 @@ Payments API built as a set of microservices. Each microservice lives in its own
 
 - Package root: `com.kaleido.software.<service-name>`
 - REST endpoints are versioned: `/api/v1/...`
-- Kafka topics: `<service-name>.<entity>.<event>` (e.g. `payment-service.payment.completed`)
+- Kafka topics: `<service-name>.<entity>.<event>` (e.g. `card-transactions-service.card-operation.rejected`) — full catalog in `doc/specs/event-catalog.md`
 - One microservice = one directory = one deployable Spring Boot application.
 
 ## Common Commands
