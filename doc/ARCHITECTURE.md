@@ -110,7 +110,7 @@ Card processing entry point: direct card payments, card-rail operations handed o
 
 - Consumes payment events from the gateway (`authorise`, `payment`, `void`, `refund` — not `authenticate`, which `threeds-service` consumes directly).
 - Performs **card-specific business validation** (card data rules, operation allowed for the current transaction lifecycle, duplicates).
-- For `CARD` `authorise`: after its own validation passes, publishes the operation for `threeds-service` to check the referenced `authenticate` transaction against its remaining cumulative ceiling (same vendor, `AUTHORIZED`, unexpired, sum of amounts not exceeded); consumes the resulting event and either proceeds to TID assignment or publishes a rejection (`REJECTED_INVALID_STATE`). See `threeds-service`.
+- For `CARD` `authorise`: after its own validation passes, publishes the operation for `threeds-service` to check the referenced `authenticate` transaction against its remaining cumulative ceiling (same vendor, `AUTHENTICATED`, unexpired, sum of amounts not exceeded); consumes the resulting event and either proceeds to TID assignment or publishes a rejection (`REJECTED_INVALID_STATE`). See `threeds-service`.
 - For `CARD` `payment`: after its own validation passes, publishes the operation for `threeds-service` to run the embedded 3DS step; consumes the resulting `THREEDS_AUTHENTICATED` (proceeds to TID assignment) or terminal (`DECLINED`/`FAILED`) event. Not applicable to `APPLE_PAY`/`GOOGLE_PAY` `payment`, which proceed directly to TID assignment.
 - For `refund` (`CARD` and wallets): validates the original `payment` is `SETTLED`, belongs to the vendor, is within its **refund eligibility window** (own configuration property, default 180 days — a platform-wide operational parameter, not per-vendor; owned here because refund eligibility is a method-specific business rule, per Validation Strategy), and that this `refund`'s amount plus its `refundedAmount` so far does not exceed the original amount (partial and multiple `refund`s allowed, unlike `void`). Owns and increments `refundedAmount` on the original `payment` itself, analogous to how `threeds-service` owns the `authenticate` ceiling.
 - On success, publishes the validated operation for TID assignment.
@@ -134,8 +134,8 @@ Consumes Google Pay operations published by the gateway; the wallet payload pass
 
 EMV 3-D Secure (3DS) cardholder authentication, `CARD` only (`APPLE_PAY`/`GOOGLE_PAY` are exempt — the wallet's own device-level cardholder verification already covers this). Serves three distinct calls, all against the scheme's Directory Server:
 
-- **Standalone `authenticate`**: consumed directly from the gateway (never reaches `card-transactions-service`, `tid-assignment-service` or `<acquirer-bank>-tx-service` — 3DS is resolved at the card scheme/issuer level, not the acquirer bank). Detokenizes the card via `card-vault-service` immediately before sending the authentication request (AReq) — the same last-hop pattern as `<acquirer-bank>-tx-service` and the network token services — which places it **in PCI scope**. On a **frictionless** issuer decision (ARes), publishes the terminal outcome directly (`AUTHORIZED` / `DECLINED` / `FAILED`). On a **challenge** decision, transitions the transaction to `CHALLENGE_REQUIRED` and publishes a challenge URL for the gateway to expose via polling; consumes the challenge-completion callback (received by the gateway's public, unauthenticated endpoint and relayed here) and publishes the final outcome, or `FAILED` if the challenge window elapses. On success, owns a **running cumulative-ceiling total** for the transaction's `amount` (see next point) — analogous to how `tid-assignment-service` owns a TID pool.
-- **`authorise` reference check**: consumes `authorise` operations published by `card-transactions-service` after its own validation. Atomically checks the referenced `authenticate` transaction — same vendor, `AUTHORIZED`, unexpired, and this `authorise`'s amount plus the running cumulative total already consumed against it does not exceed its own amount (same currency required) — increments the running total on success, and publishes the result for `card-transactions-service` to continue or reject. Also **consumes `void` events** for `authorise` transactions it previously admitted: a successful `void` decrements the running total, freeing that amount for a further `authorise` within the `authenticate`'s validity window. Does not itself talk to the Directory Server for this step (3DS already happened in the standalone `authenticate`).
+- **Standalone `authenticate`**: consumed directly from the gateway (never reaches `card-transactions-service`, `tid-assignment-service` or `<acquirer-bank>-tx-service` — 3DS is resolved at the card scheme/issuer level, not the acquirer bank). Detokenizes the card via `card-vault-service` immediately before sending the authentication request (AReq) — the same last-hop pattern as `<acquirer-bank>-tx-service` and the network token services — which places it **in PCI scope**. On a **frictionless** issuer decision (ARes), publishes the terminal outcome directly (`AUTHENTICATED` / `DECLINED` / `FAILED`). On a **challenge** decision, transitions the transaction to `CHALLENGE_REQUIRED` and publishes a challenge URL for the gateway to expose via polling; consumes the challenge-completion callback (received by the gateway's public, unauthenticated endpoint and relayed here) and publishes the final outcome, or `FAILED` if the challenge window elapses. On success, owns a **running cumulative-ceiling total** for the transaction's `amount` (see next point) — analogous to how `tid-assignment-service` owns a TID pool.
+- **`authorise` reference check**: consumes `authorise` operations published by `card-transactions-service` after its own validation. Atomically checks the referenced `authenticate` transaction — same vendor, `AUTHENTICATED`, unexpired, and this `authorise`'s amount plus the running cumulative total already consumed against it does not exceed its own amount (same currency required) — increments the running total on success, and publishes the result for `card-transactions-service` to continue or reject. Also **consumes `void` events** for `authorise` transactions it previously admitted: a successful `void` decrements the running total, freeing that amount for a further `authorise` within the `authenticate`'s validity window (the window is `threeds-service`'s own configuration property — regulation-driven, platform-wide, default 7 calendar days; same ownership pattern as the refund window in `card-transactions-service`). Does not itself talk to the Directory Server for this step (3DS already happened in the standalone `authenticate`).
 - **`payment`'s embedded 3DS step**: consumes `CARD` `payment` operations published by `card-transactions-service` after its own validation, before TID assignment. Runs the same AReq/ARes flow as standalone `authenticate` (detokenize, frictionless or challenge), but publishes `THREEDS_AUTHENTICATED` to continue the *same* transaction toward TID assignment, rather than a terminal outcome. No cumulative-ceiling tracking here — `payment` doesn't reference an external `authenticate`.
 
 **One service across all card schemes** (unlike `visa-token-service` / `mastercard-token-service`, which are split because VTS and MDES are genuinely different provisioning APIs): EMV 3DS 2.x defines a common message specification across schemes — only the Directory Server endpoint and per-scheme certificates differ, handled as internal adapters within the service.
@@ -146,7 +146,7 @@ EMV 3-D Secure (3DS) cardholder authentication, `CARD` only (`APPLE_PAY`/`GOOGLE
 
 Network tokenization services (Visa VTS and Mastercard MDES).
 
-- Consume `payment.authorized` events: after a successful first authorization, they provision a **network token** for the card against the network API and store the vault-token ↔ network-token mapping in their own database.
+- Consume `payment.authorised` events: after a successful first authorization, they provision a **network token** for the card against the network API and store the vault-token ↔ network-token mapping in their own database.
 - Publish `network-token.provisioned` events; `card-transactions-service` keeps a local replica and routes subsequent stored-credential operations through the network token (higher approval rates, resilience to card reissuance).
 - Provisioning requires the real PAN, so they detokenize against `card-vault-service` at the moment of the network call — the same last-hop pattern as `<acquirer-bank>-tx-service` — which places **both services in PCI scope**.
 
@@ -165,7 +165,7 @@ Bank integration adapter (e.g. `redsys-tx-service`, `stripe-tx-service`).
 - Consumes TID-assigned operations for its bank.
 - Detokenizes the card against `card-vault-service` immediately before calling the bank — the only point in the flow where the real PAN is used.
 - Calls the acquirer bank API and handles its protocol specifics (retries, timeouts, certificates).
-- Publishes the operation result (`authorized`, `declined`, `failed`), consumed by `notification-service`, `gateway-service`, and `tid-assignment-service`.
+- Publishes the operation result (`authorised`, `declined`, `failed`), consumed by `notification-service`, `gateway-service`, and `tid-assignment-service`.
 
 Having **one service per acquirer bank** (instead of a single bank-integration service) is deliberate:
 
@@ -185,7 +185,7 @@ Notifies the vendor of the final result of each operation (webhook to the vendor
 End-of-day settlement: generates, per acquirer bank, the file with all money-moving operations of the day and delivers it over **SFTP**. A background batch process — no request/response path.
 
 - A **single service for all banks** (the opposite strategy to `<acquirer-bank>-tx-service`, deliberately): the forces that demand per-bank isolation don't apply to a nightly batch — no latency to protect, no noisy neighbor, failures are retried within the settlement window. Per-bank variability (file format, SFTP credentials/endpoint) is handled by **per-bank adapters** behind hexagonal ports (`SettlementFileFormat`, file delivery), so extracting a bank into its own service later stays cheap.
-- Builds its **own projection**: consumes the lifecycle events of money-moving operations (sales, captures, refunds, voids) into its own PostgreSQL, modeled for settlement (operations grouped by bank and cutoff window, with batch-inclusion state). It never queries the gateway's active database. Short retention: rows are kept only a few days after batch confirmation — the canonical archive lives in reporting.
+- Builds its **own projection**: consumes the lifecycle events of money-moving operations (sales, refunds, voids) into its own PostgreSQL, modeled for settlement (operations grouped by bank and cutoff window, with batch-inclusion state). It never queries the gateway's active database. Short retention: rows are kept only a few days after batch confirmation — the canonical archive lives in reporting.
 - Each bank has its own **cutoff time and timezone**; file generation runs per bank at its cutoff.
 - **Pre-generation reconciliation**: before generating a file, aggregate counts and amounts of the projection are compared against the reporting archive (Aurora) for that bank and window. A mismatch **blocks generation and raises an alert** — an incomplete settlement file must never be sent. (Same pattern as the active-database purger: reconcile projections before an irreversible step.)
 - **Idempotent regeneration**: the file for a given bank/day is a versioned, traceable artifact that can be regenerated (SFTP failure, bank rejection) without double-settling.
@@ -240,7 +240,7 @@ Cross-cutting code is reused through internal libraries under `libs/`, consumed 
 - `authorise` **always** references a prior successful `authenticate` transaction, and **several `authorise`s may share one `authenticate`**: at step 3, once `card-transactions-service`'s own validation passes, it publishes the operation for `threeds-service` to check the reference against the `authenticate`'s remaining ceiling (cumulative amount, not a one-time reference) before continuing to TID assignment (step 4) — `authorise` never runs 3DS itself. A later `void` on that `authorise` (see below) is also consumed by `threeds-service`, freeing its amount back to the ceiling.
 - `payment` performs 3DS **as part of the same transaction**: at step 3, `card-transactions-service` publishes it for `threeds-service` to run the embedded 3DS step (frictionless or challenge, same mechanics as standalone `authenticate`); once `threeds-service` reports success, the same transaction continues to TID assignment (step 4) and onward, unlike `authorise`, which references a separately submitted `authenticate` rather than running 3DS inline.
 
-**Refund variant (`refund`)**: reverses an already-`SETTLED` `payment`, **partially or fully, possibly across multiple `refund`s**. Runs through the same pipeline as any other operation (steps 3–6): `card-transactions-service` validates the original `payment` is `SETTLED`, belongs to the vendor, and that this `refund`'s amount plus its `refundedAmount` so far does not exceed the `payment`'s original amount; `tid-assignment-service` allocates a TID; `<acquirer-bank>-tx-service` sends the reversal to the bank — a genuinely new, separately-settling money movement, unlike `void` (which prevents money from moving in the first place, is full-amount only, and at most once per transaction — no cumulative tracking needed there). On success, `card-transactions-service` increments the original `payment`'s `refundedAmount`; once it reaches the full amount the transaction transitions to `REFUNDED`, otherwise it remains `SETTLED` (see open question in the application requirements spec on whether a distinct partially-refunded state is needed).
+**Refund variant (`refund`)**: reverses an already-`SETTLED` `payment`, **partially or fully, possibly across multiple `refund`s**. Runs through the same pipeline as any other operation (steps 3–6): `card-transactions-service` validates the original `payment` is `SETTLED`, belongs to the vendor, and that this `refund`'s amount plus its `refundedAmount` so far does not exceed the `payment`'s original amount; `tid-assignment-service` allocates a TID; `<acquirer-bank>-tx-service` sends the reversal to the bank — a genuinely new, separately-settling money movement, unlike `void` (which prevents money from moving in the first place, is full-amount only, and at most once per transaction — no cumulative tracking needed there). On success, `card-transactions-service` increments the original `payment`'s `refundedAmount`; once it reaches the full amount the transaction transitions to `REFUNDED`, otherwise it remains `SETTLED` (confirmed 2026-07-17: no distinct partially-refunded state — `refundedAmount` distinguishes the case).
 
 The active-database purge policy (Data Lifecycle & Scalability) keeps a `SETTLED` `payment` un-purged for as long as it remains within its refund eligibility window, so `refund` always finds the original transaction in the active database — no cross-store read path needed. That window's length (default 180 days) directly trades off against the active database's size; see the open trade-off noted in that section.
 
@@ -248,22 +248,22 @@ The active-database purge policy (Data Lifecycle & Scalability) keeps a `SETTLED
 
 ```
 authenticate (CARD only, terminal — referenced by authorise, never continues):
-REGISTERED → VALIDATED → SENT_TO_THREEDS → AUTHORIZED | DECLINED | FAILED   (frictionless)
+REGISTERED → VALIDATED → SENT_TO_THREEDS → AUTHENTICATED | DECLINED | FAILED   (frictionless)
                                 │
-                                └─► CHALLENGE_REQUIRED → AUTHORIZED | DECLINED | FAILED (challenge, or timeout)
+                                └─► CHALLENGE_REQUIRED → AUTHENTICATED | DECLINED | FAILED (challenge, or timeout)
 
 authorise (CARD: requires a prior authenticate — no 3DS of its own):
-REGISTERED → VALIDATED → TID_ASSIGNED → SENT_TO_ACQUIRER → AUTHORIZED | DECLINED | FAILED
+REGISTERED → VALIDATED → TID_ASSIGNED → SENT_TO_ACQUIRER → AUTHORISED | DECLINED | FAILED
      └── REJECTED                                               │
                                                                   ├─► VOIDED   (via void)
                                                                   └─► EXPIRED  (window elapsed, not voided)
 
 payment (CARD: 3DS embedded in the same transaction):
-REGISTERED → VALIDATED → SENT_TO_THREEDS → THREEDS_AUTHENTICATED → TID_ASSIGNED → SENT_TO_ACQUIRER → AUTHORIZED → CAPTURED
+REGISTERED → VALIDATED → SENT_TO_THREEDS → THREEDS_AUTHENTICATED → TID_ASSIGNED → SENT_TO_ACQUIRER → AUTHORISED
                                 │                                                                        │
                                 └─► CHALLENGE_REQUIRED → THREEDS_AUTHENTICATED (continues) | DECLINED | FAILED
-CAPTURED ──► VOIDED     (via void, before settlement cutoff)
-CAPTURED ──► SETTLED    (settlement batch confirmed)
+AUTHORISED ──► VOIDED    (via void, before settlement cutoff)
+AUTHORISED ──► SETTLED   (settlement batch confirmed)
 SETTLED  ──► REFUNDED   (via refund, once fully refunded)
 ```
 
@@ -286,7 +286,7 @@ Validation is layered so that fast feedback does not require synchronous couplin
 ### Asynchronous (Kafka)
 
 - The default mechanism for service-to-service communication.
-- Events are past-tense facts (`payment.authorized`), published through the transactional outbox.
+- Events are past-tense facts (`payment.authorised`), published through the transactional outbox.
 - Topic naming: `<service-name>.<entity>.<event>` (e.g. `card-transactions-service.card-payment.rejected`).
 - Events are the public contract of a service: versioned, backward compatible.
 - Consumers are idempotent — the same event may be delivered more than once.
@@ -337,7 +337,7 @@ Additional scaling measures:
 - Status polling (`GET /payments/{id}`) scales with **read replicas** of the active database.
 - Intermediate services (`card-transactions-service`, `tid-assignment-service`, `<acquirer-bank>-tx-service`) keep only short-retention local data; the gateway and the historical store hold the canonical records.
 - Historical retention is policy-driven: card schemes require ~13 months for disputes; regulatory requirements may extend it. OpenSearch indices are rolled over and deleted by ILM; the Aurora archive is partitioned by month.
-- **Open trade-off (2026-07-13):** the refund eligibility window (default 180 days) directly sets how long every settled `payment` stays in the active database, working against the reason the active/historical split exists (keeping the hot, day-partitioned table lean). If that window is ever extended to match the ~13-month scheme dispute window instead of a shorter merchant refund policy, this cost should be reconsidered explicitly — see the application requirements spec's open question on this.
+- **Accepted trade-off (raised 2026-07-13, accepted 2026-07-17):** the refund eligibility window (default 180 days) directly sets how long every settled `payment` stays in the active database, working against the reason the active/historical split exists (keeping the hot, day-partitioned table lean). This cost is accepted at the 180-day default; it should be reconsidered explicitly only if the window ever changes materially (e.g. extended toward the ~13-month scheme dispute window).
 
 ## Repository Layout
 
